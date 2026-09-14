@@ -82,7 +82,7 @@ if (-not $target) {
     foreach ($h in [Acc]::Tops()) { $t = [Acc]::Title($h); if ($t) { "    $t" } }
     Write-Host ""
     Write-Host "Find IMR in that list, pick one distinctive word from its title,"
-    Write-Host "and change the `$WindowMatch line at the top of this file."
+    Write-Host "and change the \`\$WindowMatch line at the top of this file."
     return
 }
 
@@ -163,13 +163,13 @@ Write-Host "=========================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "Open 02-part-search.ps1 and set these three lines:" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "   `$WindowMatch = '$WindowMatch'"
+Write-Host "   \`\$WindowMatch = '$WindowMatch'"
 if ($dataRow) {
-    Write-Host "   `$PartField   = <the field number holding part numbers>"
+    Write-Host "   \`\$PartField   = <the field number holding part numbers>"
 } else {
-    Write-Host "   `$PartField   = -1"
+    Write-Host "   \`\$PartField   = -1"
 }
-Write-Host "   `$PartialMatch = `$true"
+Write-Host "   \`\$PartialMatch = \`\$true"
 Write-Host ""
 Write-Host "ALSO CHECK THIS:" -ForegroundColor Yellow
 Write-Host "The grid reported $($best.Count) rows. Compare that to how many"

@@ -90,6 +90,12 @@ Enter. IMR jumps to that row and selects it.
   number like `CAP`.
 - **Reload grid** — press after loading a different order, so it
   re-reads the new rows.
+- **Scroll mode** — tick this only if the probe reported far fewer rows
+  than the order actually contains. Instead of reading everything up
+  front, it pages the grid from the top and checks each screenful until
+  it finds a match. Slower, a second or two on a long order, but it
+  reaches rows that are not otherwise exposed. Leave it off if the row
+  counts matched; normal mode is instant.
 - **Shrink** — collapses the window down to just the search box.
 - **Minimize** — normal minimize button, sends it to the taskbar.
 - **Ctrl + Shift + F** — brings it back from minimized and puts the

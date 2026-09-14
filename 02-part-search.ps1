@@ -39,6 +39,7 @@ public class Acc {
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr wp, IntPtr lp);
     [DllImport("oleacc.dll")] public static extern int AccessibleObjectFromWindow(
         IntPtr hwnd, uint dwId, ref Guid riid,
         [MarshalAs(UnmanagedType.IDispatch)] out object ppv);
@@ -69,6 +70,7 @@ function AccCount($o)              { try { [System.__ComObject].InvokeMember("ac
 function AccSelect($o,[int]$id)    { try { [System.__ComObject].InvokeMember("accSelect",$BF::InvokeMethod,$null,$o,@(3,$id)) | Out-Null; $true } catch { $false } }
 
 $script:gridAcc    = $null
+$script:gridHwnd   = [IntPtr]::Zero
 $script:gridRows   = 0
 $script:targetHwnd = [IntPtr]::Zero
 $script:cache      = $null
@@ -85,16 +87,17 @@ function Connect-Target {
     if (-not $t) { return "IMR window not found. Is it open?" }
     $script:targetHwnd = $t
 
-    $bestAcc = $null; $bestN = 3
+    $bestAcc = $null; $bestN = 3; $bestH = [IntPtr]::Zero
     foreach ($k in [Acc]::Kids($t)) {
         $a = [Acc]::FromWindow($k)
         if (-not $a) { continue }
         $n = AccCount $a
-        if ($n -gt $bestN) { $bestN = $n; $bestAcc = $a }
+        if ($n -gt $bestN) { $bestN = $n; $bestAcc = $a; $bestH = $k }
     }
     if (-not $bestAcc) { return "Found IMR but could not read its grid." }
 
     $script:gridAcc  = $bestAcc
+    $script:gridHwnd = $bestH
     $script:gridRows = $bestN
     $script:cache    = $null
     return $null
@@ -117,10 +120,57 @@ function Get-PartText([string]$rowText) {
     return $rowText
 }
 
+function Test-RowMatch([string]$rowText, [string]$upperTerm) {
+    $p = (Get-PartText $rowText).ToUpper()
+    if ($PartialMatch) { return $p.Contains($upperTerm) }
+    return $p.Trim() -eq $upperTerm
+}
+
+# ---- scrolling search, for grids that only expose visible rows -------
+# Pages the grid from the top, reading each screenful, until a match is
+# found or the view stops changing. Slower, but reaches every row.
+function Find-ByScrolling([string]$term) {
+    $WM_VSCROLL = 0x0115
+    $SB_PAGEDOWN = [IntPtr]3
+    $SB_TOP      = [IntPtr]6
+    $t = $term.ToUpper()
+
+    [Acc]::SendMessage($script:gridHwnd, $WM_VSCROLL, $SB_TOP, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 180
+
+    $prevFirst = [guid]::NewGuid().ToString()
+    $scanned   = 0
+
+    for ($page = 0; $page -lt 800; $page++) {
+        $n = AccCount $script:gridAcc
+        if ($n -le 0) { break }
+
+        $first = ''
+        for ($i = 1; $i -le $n; $i++) {
+            $v = AccProp $script:gridAcc "accValue" $i
+            if (-not $v) { $v = AccProp $script:gridAcc "accName" $i }
+            $v = [string]$v
+            if ($i -eq 1) { $first = $v }
+            if ($v -and (Test-RowMatch $v $t)) {
+                return [pscustomobject]@{ Id = $i; Text = $v; Scanned = $scanned + $i; Pages = $page + 1 }
+            }
+        }
+        $scanned += $n
+
+        # view stopped changing, we are at the bottom
+        if ($first -eq $prevFirst) { break }
+        $prevFirst = $first
+
+        [Acc]::SendMessage($script:gridHwnd, $WM_VSCROLL, $SB_PAGEDOWN, [IntPtr]::Zero) | Out-Null
+        Start-Sleep -Milliseconds 130
+    }
+    return $null
+}
+
 # ---- UI --------------------------------------------------------------
 $form                 = New-Object System.Windows.Forms.Form
 $form.Text            = "Find Part   (Ctrl+Shift+F to recall)"
-$form.Size            = New-Object System.Drawing.Size(400, 180)
+$form.Size            = New-Object System.Drawing.Size(400, 205)
 $form.TopMost         = $true
 $form.FormBorderStyle = 'FixedSingle'
 $form.MinimizeBox     = $true
@@ -164,8 +214,15 @@ $hint.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
 $hint.ForeColor = [System.Drawing.Color]::Gray
 $form.Controls.Add($hint)
 
+$chkScroll          = New-Object System.Windows.Forms.CheckBox
+$chkScroll.Text     = "Scroll mode (use if the grid only exposes visible rows)"
+$chkScroll.Location = New-Object System.Drawing.Point(12, 84)
+$chkScroll.Size     = New-Object System.Drawing.Size(370, 22)
+$chkScroll.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
+$form.Controls.Add($chkScroll)
+
 $lbl          = New-Object System.Windows.Forms.Label
-$lbl.Location = New-Object System.Drawing.Point(12, 88)
+$lbl.Location = New-Object System.Drawing.Point(12, 112)
 $lbl.Size     = New-Object System.Drawing.Size(370, 52)
 $lbl.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 $form.Controls.Add($lbl)
@@ -181,6 +238,34 @@ $doFind = {
         $e = Connect-Target
         if ($e) { Say $e ([System.Drawing.Color]::Firebrick); return }
     }
+
+    # ---------- scrolling mode ----------
+    if ($chkScroll.Checked) {
+        Say "Scanning by scrolling..." ([System.Drawing.Color]::Black)
+        [Acc]::SetForegroundWindow($script:targetHwnd) | Out-Null
+        Start-Sleep -Milliseconds 60
+
+        $r = Find-ByScrolling $term
+        $form.TopMost = $true
+
+        if (-not $r) {
+            Say "No match found after scrolling the whole grid." ([System.Drawing.Color]::Firebrick)
+            $txt.SelectAll(); $txt.Focus()
+            return
+        }
+
+        $ok = AccSelect $script:gridAcc $r.Id
+        $part = (Get-PartText $r.Text).Trim()
+        if ($ok) {
+            Say "$part`nFound after $($r.Scanned) rows, $($r.Pages) page(s)." ([System.Drawing.Color]::ForestGreen)
+        } else {
+            Say "$part`nFound but could not move the selection." ([System.Drawing.Color]::DarkOrange)
+        }
+        $txt.SelectAll(); $txt.Focus()
+        return
+    }
+
+    # ---------- cached mode ----------
     if (-not $script:cache) {
         Say "Reading grid..." ([System.Drawing.Color]::Black)
         Build-Cache
@@ -192,15 +277,14 @@ $doFind = {
     $t = $term.ToUpper()
     $hit = -1; $total = 0
     for ($i = 0; $i -lt $script:cache.Count; $i++) {
-        $p = (Get-PartText $script:cache[$i].Text).ToUpper()
-        $m = if ($PartialMatch) { $p.Contains($t) } else { $p.Trim() -eq $t }
-        if ($m) { $total++; if ($hit -lt 0 -and $i -ge $start) { $hit = $i } }
+        if (Test-RowMatch $script:cache[$i].Text $t) {
+            $total++
+            if ($hit -lt 0 -and $i -ge $start) { $hit = $i }
+        }
     }
     if ($hit -lt 0 -and $total -gt 0) {
         for ($i = 0; $i -lt $script:cache.Count; $i++) {
-            $p = (Get-PartText $script:cache[$i].Text).ToUpper()
-            $m = if ($PartialMatch) { $p.Contains($t) } else { $p.Trim() -eq $t }
-            if ($m) { $hit = $i; break }
+            if (Test-RowMatch $script:cache[$i].Text $t) { $hit = $i; break }
         }
     }
 
@@ -237,7 +321,7 @@ $btnReload.Add_Click({
 $script:slim = $false
 $btnSlim.Add_Click({
     if ($script:slim) {
-        $form.Size = New-Object System.Drawing.Size(400, 180)
+        $form.Size = New-Object System.Drawing.Size(400, 205)
         $btnSlim.Text = "Shrink"
         $script:slim = $false
     } else {
