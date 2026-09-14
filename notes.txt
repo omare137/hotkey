@@ -1,8 +1,17 @@
 sequence:
+
+Open IMR with an order loaded. Turn the volume down. Ctrl+Windows+Enter to start Narrator, click into the part number table, press the down arrow a few times, Ctrl+Windows+Enter to stop.
+
 Open IMR, load an order.
+
 Paste the handoff prompt into Copilot.
+
 Run 01-probe.ps1 in PowerShell.
+
 Paste its output to Copilot.
+
 Copilot reads the output with you and tells you the three config values, mainly which semicolon field holds the part number.
+
 Open 02-part-search.ps1 in Notepad, put those three values in the CONFIG block, save.
+
 Paste 02-part-search.ps1 into PowerShell. Search box appears. Test it.
