@@ -254,13 +254,60 @@ all the benefit of the search, none of the risk of a stray click.
 
 ---
 
+## Where the screenshots go
+
+Short answer: **nowhere.** The daily tool (`04-ocr-search.ps1`) never
+writes an image to disk, and nothing in this repo makes a network call
+of any kind.
+
+The capture path is entirely in memory:
+
+1. `CopyFromScreen` draws the window into a `System.Drawing.Bitmap` in RAM.
+2. It is encoded into a `MemoryStream`, then an
+   `InMemoryRandomAccessStream` — both RAM only, as the names say.
+3. `Windows.Media.Ocr` reads that and returns text plus bounding boxes.
+4. Every bitmap and stream is disposed in a `finally` block, on all
+   paths including errors. The pixels exist for one recognise call and
+   are then released.
+
+What survives a search is the recognised **text**, held only long
+enough to match against what you typed, plus the one line shown in the
+status label. Nothing is cached between searches, written to a log, or
+put on the clipboard.
+
+**The OCR engine is on-device.** `Windows.Media.Ocr` is the local
+recognition engine built into Windows 10/11. It is not, and does not
+call, a cloud service.
+
+### The one exception
+
+`03-ocr-spike.ps1` — the diagnostic you run once to check OCR
+legibility — **does** save a PNG, by design, so you can see what OCR
+saw:
+
+```
+%TEMP%\imr-ocr-spike.png
+```
+
+That file **persists until something deletes it**, and on a real IMR
+window it is a picture containing live order data. The script now
+prints its location and the delete command when it finishes. To avoid
+writing it at all, set `$SaveShot = ''` at the top of that script.
+
+Nothing else in this repo writes an image anywhere.
+
+---
+
 ## What to tell quality / IT
 
 This tool reads the screen and (in OCR mode) moves the mouse wheel and
 the mouse pointer, and issues a single left click to select the row it
 found — the same input an operator's hand produces, and nothing beyond
 it. It does not read the database, does not read IMR's memory, and does
-not modify IMR or any data. It uses only software that
+not modify IMR or any data. It makes no network calls whatsoever, and
+the screenshots it takes are held in memory for a single OCR call and
+then released — none are written to disk (see **Where the screenshots
+go** above for the one diagnostic exception). It uses only software that
 ships with a standard Windows PC — the built-in OCR engine and built-in
 .NET, run from the PowerShell that is already on the machine. Nothing is
 installed or downloaded; the only thing placed on the workstation is the

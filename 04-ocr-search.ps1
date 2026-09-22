@@ -147,22 +147,33 @@ $null = [Windows.Graphics.Imaging.SoftwareBitmap,   Windows.Graphics.Imaging,   
 $null = [Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
 $null = [Windows.Storage.Streams.DataWriter,        Windows.Storage.Streams,     ContentType = WindowsRuntime]
 
+# Everything here is in-memory: a MemoryStream and an
+# InMemoryRandomAccessStream. The captured pixels never touch disk.
+# The streams are released as soon as the bitmap is decoded, so a long
+# search does not accumulate screen contents in memory.
 function ConvertTo-SoftwareBitmap([System.Drawing.Bitmap]$bmp) {
     $ms = New-Object System.IO.MemoryStream
-    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Bmp)
-    $bytes = $ms.ToArray()
-    $ms.Dispose()
+    try {
+        $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Bmp)
+        $bytes = $ms.ToArray()
+    }
+    finally { $ms.Dispose() }
 
     $ras    = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
     $writer = New-Object Windows.Storage.Streams.DataWriter($ras)
-    $writer.WriteBytes($bytes)
-    Await $writer.StoreAsync() ([uint32]) | Out-Null
-    $writer.DetachStream() | Out-Null
-    $ras.Seek(0)
+    try {
+        $writer.WriteBytes($bytes)
+        Await $writer.StoreAsync() ([uint32]) | Out-Null
+        $writer.DetachStream() | Out-Null
+        $ras.Seek(0)
 
-    $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) ([Windows.Graphics.Imaging.BitmapDecoder])
-    $swBmp   = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-    return $swBmp
+        $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) ([Windows.Graphics.Imaging.BitmapDecoder])
+        return (Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap]))
+    }
+    finally {
+        $writer.Dispose()
+        $ras.Dispose()
+    }
 }
 
 # ---- OCR engine singleton --------------------------------------------
@@ -185,45 +196,51 @@ function Capture-And-OCR([int]$left, [int]$top, [int]$w, [int]$h) {
     # Do-Search drops our own window behind the grid before calling this,
     # so the search box (which holds the very term being looked for, and
     # would otherwise be read back as a false match) is not in the pixels.
-    $shot = New-Object System.Drawing.Bitmap($w, $h)
-    $g = [System.Drawing.Graphics]::FromImage($shot)
-    $g.CopyFromScreen($left, $top, 0, 0, $shot.Size)
-    $g.Dispose()
+    # Every bitmap is released in the finally below, on all paths. The
+    # captured pixels exist only for the duration of one recognise call.
+    $shot = $null; $proc = $null; $swBmp = $null
+    try {
+        $shot = New-Object System.Drawing.Bitmap($w, $h)
+        $g = [System.Drawing.Graphics]::FromImage($shot)
+        try { $g.CopyFromScreen($left, $top, 0, 0, $shot.Size) }
+        finally { $g.Dispose() }
 
-    $proc = $shot
-    if ($Upscale -ne 1.0 -or $Contrast -ne 1.0) {
-        $nw = [int]($w * $Upscale)
-        $nh = [int]($h * $Upscale)
-        $big = New-Object System.Drawing.Bitmap($nw, $nh)
-        $bg  = [System.Drawing.Graphics]::FromImage($big)
-        $bg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-
-        if ($Contrast -ne 1.0) {
-            $c = [float]$Contrast
-            $t = [float]((1 - $c) / 2)
-            $cm = New-Object System.Drawing.Imaging.ColorMatrix
-            $cm.Matrix00 = $c; $cm.Matrix11 = $c; $cm.Matrix22 = $c
-            $cm.Matrix40 = $t; $cm.Matrix41 = $t; $cm.Matrix42 = $t
-            $ia = New-Object System.Drawing.Imaging.ImageAttributes
-            $ia.SetColorMatrix($cm)
-            $bg.DrawImage($shot, (New-Object System.Drawing.Rectangle(0,0,$nw,$nh)), 0,0,$w,$h, [System.Drawing.GraphicsUnit]::Pixel, $ia)
-        } else {
-            $bg.DrawImage($shot, 0, 0, $nw, $nh)
+        $proc = $shot
+        if ($Upscale -ne 1.0 -or $Contrast -ne 1.0) {
+            $nw = [int]($w * $Upscale)
+            $nh = [int]($h * $Upscale)
+            $big = New-Object System.Drawing.Bitmap($nw, $nh)
+            $bg  = [System.Drawing.Graphics]::FromImage($big)
+            try {
+                $bg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                if ($Contrast -ne 1.0) {
+                    $c = [float]$Contrast
+                    $t = [float]((1 - $c) / 2)
+                    $cm = New-Object System.Drawing.Imaging.ColorMatrix
+                    $cm.Matrix00 = $c; $cm.Matrix11 = $c; $cm.Matrix22 = $c
+                    $cm.Matrix40 = $t; $cm.Matrix41 = $t; $cm.Matrix42 = $t
+                    $ia = New-Object System.Drawing.Imaging.ImageAttributes
+                    $ia.SetColorMatrix($cm)
+                    $bg.DrawImage($shot, (New-Object System.Drawing.Rectangle(0,0,$nw,$nh)), 0,0,$w,$h, [System.Drawing.GraphicsUnit]::Pixel, $ia)
+                } else {
+                    $bg.DrawImage($shot, 0, 0, $nw, $nh)
+                }
+            }
+            finally { $bg.Dispose() }
+            $proc = $big
         }
-        $bg.Dispose()
-        $proc = $big
+
+        $eng = Get-OcrEngine
+        if (-not $eng) { return $null }
+
+        $swBmp = ConvertTo-SoftwareBitmap $proc
+        return (Await ($eng.RecognizeAsync($swBmp)) ([Windows.Media.Ocr.OcrResult]))
     }
-
-    $eng = Get-OcrEngine
-    if (-not $eng) { return $null }
-
-    $swBmp  = ConvertTo-SoftwareBitmap $proc
-    $result = Await ($eng.RecognizeAsync($swBmp)) ([Windows.Media.Ocr.OcrResult])
-
-    $shot.Dispose()
-    if ($proc -ne $shot) { $proc.Dispose() }
-
-    return $result
+    finally {
+        if ($swBmp) { $swBmp.Dispose() }
+        if ($proc -and -not [Object]::ReferenceEquals($proc, $shot)) { $proc.Dispose() }
+        if ($shot) { $shot.Dispose() }
+    }
 }
 
 # ---- window picking --------------------------------------------------

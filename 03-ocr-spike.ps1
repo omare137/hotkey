@@ -27,8 +27,12 @@
 $Upscale = 2.0
 # Boost contrast to help OCR separate text from grid lines. 1 = off.
 $Contrast = 1.0
-# Save the captured image next to nothing (temp) so you can eyeball
-# exactly what OCR saw. Blank to skip.
+# Save the captured image so you can eyeball exactly what OCR saw.
+#
+# THIS IS THE ONLY PLACE EITHER TOOL WRITES A SCREENSHOT TO DISK, and
+# the file stays there until something deletes it. It is a picture of
+# whatever was on screen, so on a real IMR window it contains live
+# order data. Set this to '' to keep the capture in memory only.
 $SaveShot = "$env:TEMP\imr-ocr-spike.png"
 # ----------------------------
 
@@ -198,3 +202,13 @@ Write-Host ""
 
 $shot.Dispose()
 if ($proc -ne $shot) { $proc.Dispose() }
+
+if ($SaveShot -and (Test-Path $SaveShot)) {
+    Write-Host "CLEAN UP:" -ForegroundColor Yellow
+    Write-Host "A screenshot of that window is now sitting at:"
+    Write-Host "  $SaveShot" -ForegroundColor White
+    Write-Host "It will stay there until deleted. If the window held real"
+    Write-Host "order data, delete it when you are done looking:"
+    Write-Host "  Remove-Item '$SaveShot'" -ForegroundColor White
+    Write-Host ""
+}
