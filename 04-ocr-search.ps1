@@ -62,6 +62,10 @@ $AutoClick    = $true
 # How far right of the row's leftmost text to click, in pixels. This
 # should land inside the Part Number cell, not on the row edge.
 $ClickInsetX  = 25
+# Seconds before the search box and the result line are blanked, so a
+# part number and the row it matched are not left sitting on screen
+# after the operator walks away. 0 disables the auto-clear.
+$ClearAfterSec = 30
 # ================================================
 
 Add-Type -AssemblyName System.Drawing
@@ -119,6 +123,31 @@ public class Win {
     public static string Title(IntPtr h) {
         StringBuilder sb = new StringBuilder(512); GetWindowText(h, sb, 512); return sb.ToString();
     }
+
+    // Overwrite a block of unmanaged memory with zeros. Disposing a
+    // bitmap only hands its memory back to the allocator; the pixels
+    // stay readable in that freed block until something happens to
+    // reuse it. Zeroing first means there is nothing left to recover.
+    public static void ZeroMemory(IntPtr dest, long len) {
+        if (dest == IntPtr.Zero || len <= 0) return;
+        byte[] zeros = new byte[65536];
+        long off = 0;
+        while (off < len) {
+            int n = (int)Math.Min((long)zeros.Length, len - off);
+            Marshal.Copy(zeros, 0, new IntPtr(dest.ToInt64() + off), n);
+            off += n;
+        }
+    }
+}
+
+// Lets us reach the raw bytes behind a WinRT memory buffer, which is
+// the only way to zero the decoded copy of the screen that the OCR
+// engine actually reads.
+[ComImport]
+[Guid("5B0D3235-4DBA-4D44-865E-8F1D0E4FD04D")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IMemoryBufferByteAccess {
+    void GetBuffer(out IntPtr buffer, out uint capacity);
 }
 "@
 
@@ -147,17 +176,63 @@ $null = [Windows.Graphics.Imaging.SoftwareBitmap,   Windows.Graphics.Imaging,   
 $null = [Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
 $null = [Windows.Storage.Streams.DataWriter,        Windows.Storage.Streams,     ContentType = WindowsRuntime]
 
+# ---- wiping captured pixels ------------------------------------------
+# Disposing a buffer returns it to the allocator without erasing it, so
+# every copy of the screen is overwritten with zeros before release.
+
+function Clear-BitmapPixels([System.Drawing.Bitmap]$bmp) {
+    if (-not $bmp) { return }
+    try {
+        $rect = New-Object System.Drawing.Rectangle(0, 0, $bmp.Width, $bmp.Height)
+        $data = $bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::WriteOnly, $bmp.PixelFormat)
+        try {
+            [Win]::ZeroMemory($data.Scan0, ([long][Math]::Abs($data.Stride) * $data.Height))
+        }
+        finally { $bmp.UnlockBits($data) }
+    }
+    catch { }
+}
+
+# Best effort: reaching a WinRT buffer needs COM interop that can fail
+# on some builds. A failure here leaves this one decoded copy to the
+# allocator; every other copy is still wiped.
+function Clear-SoftwareBitmap($swBmp) {
+    if (-not $swBmp) { return }
+    try {
+        $buf = $swBmp.LockBuffer([Windows.Graphics.Imaging.BitmapBufferAccessMode]::Write)
+        try {
+            $ref = $buf.CreateReference()
+            try {
+                $access = [IMemoryBufferByteAccess]$ref
+                $ptr = [IntPtr]::Zero
+                $cap = [uint32]0
+                $access.GetBuffer([ref]$ptr, [ref]$cap)
+                [Win]::ZeroMemory($ptr, [long]$cap)
+            }
+            finally { $ref.Dispose() }
+        }
+        finally { $buf.Dispose() }
+    }
+    catch { }
+}
+
 # Everything here is in-memory: a MemoryStream and an
 # InMemoryRandomAccessStream. The captured pixels never touch disk.
-# The streams are released as soon as the bitmap is decoded, so a long
-# search does not accumulate screen contents in memory.
 function ConvertTo-SoftwareBitmap([System.Drawing.Bitmap]$bmp) {
+    $bytes = $null
     $ms = New-Object System.IO.MemoryStream
     try {
         $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Bmp)
         $bytes = $ms.ToArray()
+        # ToArray copied it out, so the stream still holds an encoded
+        # image of the screen in its own array. Blank that too.
+        $inner = $ms.GetBuffer()
+        [Array]::Clear($inner, 0, $inner.Length)
     }
+    catch { }
     finally { $ms.Dispose() }
+
+    if (-not $bytes) { return $null }
 
     $ras    = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
     $writer = New-Object Windows.Storage.Streams.DataWriter($ras)
@@ -171,6 +246,7 @@ function ConvertTo-SoftwareBitmap([System.Drawing.Bitmap]$bmp) {
         return (Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap]))
     }
     finally {
+        [Array]::Clear($bytes, 0, $bytes.Length)
         $writer.Dispose()
         $ras.Dispose()
     }
@@ -237,9 +313,20 @@ function Capture-And-OCR([int]$left, [int]$top, [int]$w, [int]$h) {
         return (Await ($eng.RecognizeAsync($swBmp)) ([Windows.Media.Ocr.OcrResult]))
     }
     finally {
-        if ($swBmp) { $swBmp.Dispose() }
-        if ($proc -and -not [Object]::ReferenceEquals($proc, $shot)) { $proc.Dispose() }
-        if ($shot) { $shot.Dispose() }
+        # Wipe before release, in reverse order of creation. Each of
+        # these holds a full copy of the captured screen.
+        if ($swBmp) {
+            Clear-SoftwareBitmap $swBmp
+            $swBmp.Dispose()
+        }
+        if ($proc -and -not [Object]::ReferenceEquals($proc, $shot)) {
+            Clear-BitmapPixels $proc
+            $proc.Dispose()
+        }
+        if ($shot) {
+            Clear-BitmapPixels $shot
+            $shot.Dispose()
+        }
     }
 }
 
@@ -443,9 +530,24 @@ function Send-Wheel([IntPtr]$hwnd, [int]$notches) {
 }
 
 # ---- the main search pipeline ----------------------------------------
+# Detecting "the grid stopped moving" only needs to know whether a page
+# reads the same as the last one, never what it said. Keeping a hash
+# instead of the text means no page of order data is held across the
+# loop -- only 32 bytes that cannot be read back.
+function Get-PageFingerprint([string]$s) {
+    if (-not $s) { return '' }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $b = [System.Text.Encoding]::UTF8.GetBytes($s)
+        try { return [Convert]::ToBase64String($sha.ComputeHash($b)) }
+        finally { [Array]::Clear($b, 0, $b.Length) }
+    }
+    finally { $sha.Dispose() }
+}
+
 # Capture the target window and look for the term. Returns the hit, or
-# $null, plus the raw page text so the caller can tell when scrolling has
-# stopped moving.
+# $null, plus a fingerprint of the page so the caller can tell when
+# scrolling has stopped moving.
 function Scan-Once([IntPtr]$hwnd, [string]$term, [float]$scale) {
     $r = New-Object Win+RECT
     [Win]::GetWindowRect($hwnd, [ref]$r) | Out-Null
@@ -457,10 +559,10 @@ function Scan-Once([IntPtr]$hwnd, [string]$term, [float]$scale) {
     if (-not $ocr) { return $null }
 
     return [pscustomobject]@{
-        Hit     = (Search-Screen $ocr $term $scale)
-        Text    = $ocr.Text
-        WinLeft = $r.Left
-        WinTop  = $r.Top
+        Hit         = (Search-Screen $ocr $term $scale)
+        Fingerprint = (Get-PageFingerprint $ocr.Text)
+        WinLeft     = $r.Left
+        WinTop      = $r.Top
     }
 }
 
@@ -508,7 +610,7 @@ function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [Syste
         # past the starting point to the top. Between them those two
         # passes cover the whole grid without ever needing to jump to a
         # known position, which no message we can send would do reliably.
-        $prevText = $scan.Text
+        $prevSeen = $scan.Fingerprint
         $total    = 0
 
         foreach ($dir in @(-1, 1)) {
@@ -549,13 +651,13 @@ function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [Syste
                 }
 
                 # Nothing moved, so this end of the grid is reached.
-                if ($scan.Text -eq $prevText) { break }
-                $prevText = $scan.Text
+                if ($scan.Fingerprint -eq $prevSeen) { break }
+                $prevSeen = $scan.Fingerprint
             }
 
             # Force the up pass to run even though the down pass just
             # ended on a page that stopped changing.
-            $prevText = ''
+            $prevSeen = ''
         }
 
         $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
@@ -563,6 +665,13 @@ function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [Syste
     }
     finally {
         if ($wasTop) { $parentForm.TopMost = $true }
+
+        # The wipes above have already zeroed each buffer, so this is
+        # about reclaiming them now rather than whenever the GC feels
+        # like it -- no freed block keeps its shape until then.
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+        [System.GC]::Collect()
     }
 }
 
@@ -723,10 +832,26 @@ $btnTestGrid.Add_Click({
     $txt.Focus()
 })
 
+# ---- auto-clear the visible leftovers ---------------------------------
+# A part number in the box and the row it matched in the result line are
+# both order data left sitting on screen. Blank them a short while after
+# the search so nothing lingers once the operator moves on.
+$clearTimer          = New-Object System.Windows.Forms.Timer
+$clearTimer.Interval = [Math]::Max(1, $ClearAfterSec) * 1000
+$clearTimer.Add_Tick({
+    $clearTimer.Stop()
+    $txt.Clear()
+    $lbl.Text = ''
+})
+
 $doFind = {
     $term = $txt.Text.Trim()
     if (-not $term) { return }
+    $clearTimer.Stop()
+
     Do-Search $term $lbl $form
+
+    if ($ClearAfterSec -gt 0) { $clearTimer.Start() }
     $txt.SelectAll()
     $txt.Focus()
 }
@@ -773,6 +898,9 @@ $hotTimer.Start()
 
 $form.Add_FormClosing({
     $hotTimer.Stop()
+    $clearTimer.Stop()
+    $txt.Clear()
+    $lbl.Text = ''
 })
 
 $form.Add_Shown({

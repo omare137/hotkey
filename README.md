@@ -266,14 +266,62 @@ The capture path is entirely in memory:
 2. It is encoded into a `MemoryStream`, then an
    `InMemoryRandomAccessStream` — both RAM only, as the names say.
 3. `Windows.Media.Ocr` reads that and returns text plus bounding boxes.
-4. Every bitmap and stream is disposed in a `finally` block, on all
-   paths including errors. The pixels exist for one recognise call and
-   are then released.
+4. Every buffer is **overwritten with zeros and then released**, in a
+   `finally` block, on all paths including errors.
 
-What survives a search is the recognised **text**, held only long
-enough to match against what you typed, plus the one line shown in the
-status label. Nothing is cached between searches, written to a log, or
-put on the clipboard.
+Nothing is cached between searches, written to a log, or put on the
+clipboard.
+
+### Why zeroing, and not just disposing
+
+`Dispose()` hands memory back to the allocator; it does not erase it.
+The pixels stay readable in that freed block until something else
+happens to reuse it. So each copy of the screen is zeroed first:
+
+| Copy of the screen | How it is wiped |
+|---|---|
+| Raw `CopyFromScreen` bitmap | `LockBits` + zero fill, then dispose |
+| Upscaled/contrast-boosted bitmap | `LockBits` + zero fill, then dispose |
+| Encoded BMP byte array | `Array.Clear` |
+| `MemoryStream`'s internal array | `Array.Clear` on `GetBuffer()` |
+| Decoded `SoftwareBitmap` (what OCR reads) | `IMemoryBufferByteAccess` + zero fill — **best effort**, see below |
+
+The page text is **never retained**. Scroll detection only needs to
+know whether a page reads the same as the last one, so the tool keeps a
+SHA-256 fingerprint instead of the text — 32 bytes that cannot be read
+back into order data. After each search it forces a GC pass so the
+zeroed blocks are reclaimed immediately rather than eventually.
+
+The search box and the result line are blanked `$ClearAfterSec` seconds
+after a search (default 30), so a part number and the row it matched
+are not left on screen after the operator walks away.
+
+### What is *not* guaranteed
+
+Be straight about this if someone asks:
+
+- **The `SoftwareBitmap` wipe is best effort.** Reaching a WinRT buffer
+  needs COM interop that can fail on some Windows builds. It is wrapped
+  in a `try`/`catch`; if it fails, that one decoded copy goes back to
+  the allocator unwiped, and every other copy is still zeroed.
+- **Managed strings cannot be scrubbed.** The recognised text and the
+  term you type are .NET strings — immutable, moved by the GC, with no
+  supported way to overwrite them. They are dropped promptly, but
+  "dropped" is the honest word, not "erased".
+- **Paging is outside the script's control.** Windows may write any of
+  this memory to the pagefile, or to `hiberfil.sys` on sleep, before it
+  is wiped. Preventing that needs `VirtualLock` on every buffer, which
+  GDI+ and WinRT do not expose.
+- **The OS may capture the screen independently.** Clipboard history,
+  Windows Recall on Copilot+ PCs, DLP/endpoint agents and screen
+  recorders all see the same pixels regardless of what this tool does.
+- **Any process running as the same user can read this process's
+  memory.** That is a Windows property, not something a script can fix.
+
+None of that is an argument against the tool — it is the same footing
+as IMR itself, which has the data on screen either way. It is just the
+set of claims that will not survive a determined reviewer, so do not
+make them.
 
 **The OCR engine is on-device.** `Windows.Media.Ocr` is the local
 recognition engine built into Windows 10/11. It is not, and does not
