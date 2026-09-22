@@ -162,12 +162,40 @@ open window. Pick the one holding the grid:
   without IMR, then selects it in the list for you.
 
 Then type a part number and press Enter. The tool:
-- Brings the selected window to the front
-- Hides its own search box (so OCR can't read the term back and
-  false-match on it), screenshots the window, and runs OCR
+- Brings the selected window to the front and drops its own search box
+  behind it (so the box isn't in the screenshot, isn't under the
+  pointer, and can't swallow the click)
+- Screenshots the window and runs OCR
 - If the part isn't on screen, scrolls the grid and re-scans
 - **Moves the mouse onto the matching row and clicks it**, so IMR
   selects that row exactly as if you had clicked it by hand
+
+Press **Esc** to abort a long search.
+
+### How scrolling works
+
+The rows live in a *child* control inside the window. Posting
+`WM_MOUSEWHEEL` or `WM_VSCROLL` to the top-level window scrolls
+nothing, because those messages never reach the control that owns the
+scrollbar — and in an owner-drawn grid there's no reliable way to find
+that control.
+
+So the tool parks the real mouse pointer over the grid and emits a real
+wheel event. Windows routes it to whatever is under the pointer, exactly
+as if you'd spun the wheel yourself, which works no matter how the grid
+is built.
+
+There is also no dependable way to jump straight to the top. Instead the
+tool sweeps **down to the bottom, then back up to the top**. Those two
+passes together cover the whole grid from wherever you happened to be
+sitting, without needing an absolute position. It knows it has reached an
+end when a scroll stops changing what OCR reads.
+
+- `$WheelNotches` — how far each scroll step moves (default 5 notches,
+  roughly 15 rows). **Lower it if rows get skipped between scans**;
+  raise it to sweep long orders faster.
+- `$MaxPages` — safety limit on scroll steps, applied to each pass
+  separately.
 
 - **Fuzzy OCR** (`$FuzzyOCR = $true`) — treats common OCR confusable
   characters (0/O, 1/I/l, 5/S, 8/B) as equivalent when matching

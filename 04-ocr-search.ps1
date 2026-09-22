@@ -7,9 +7,13 @@
 #  moves the mouse onto that row and clicks it, so IMR selects
 #  the row exactly as if the operator had clicked it themselves.
 #
-#  If the part is not on the current screen, the tool scrolls
-#  the grid one page at a time, re-screenshots, and re-OCRs,
-#  repeating until it finds the part or reaches the bottom.
+#  If the part is not on the current screen, the tool scrolls by
+#  spinning the real mouse wheel over the grid, re-screenshots and
+#  re-OCRs after each step, and sweeps DOWN to the bottom then
+#  back UP to the top. Those two passes cover the whole grid from
+#  wherever the operator happened to be sitting, which matters
+#  because there is no dependable way to jump to a known row.
+#  Press Esc to abort a long search.
 #
 #  STOCK WINDOWS ONLY. Nothing installed, nothing downloaded.
 #  Uses only System.Drawing, System.Windows.Forms, and the
@@ -42,8 +46,12 @@ $Upscale      = 2.0
 # Boost contrast to help separate text from grid lines. 1 = off.
 $Contrast     = 1.0
 # Milliseconds to wait after scrolling before re-capturing.
-$ScrollDelay  = 200
-# Maximum pages to scroll before giving up.
+$ScrollDelay  = 220
+# Wheel notches per scroll step. Most grids move 3 rows per notch, so 5
+# advances about 15 rows. Lower this if rows are being skipped between
+# scans; raise it to search long orders faster.
+$WheelNotches = 5
+# Maximum scroll steps before giving up.
 $MaxPages     = 200
 # Fuzzy match: treat common OCR confusable characters as equivalent.
 $FuzzyOCR     = $true
@@ -70,8 +78,6 @@ public class Win {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr p);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
@@ -84,7 +90,9 @@ public class Win {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
-    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, IntPtr extra);
+    // dwData is declared int, not uint, so a negative wheel delta
+    // (scroll down) can be passed straight through.
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, int data, IntPtr extra);
     [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
     [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
 
@@ -96,11 +104,6 @@ public class Win {
         if (h == IntPtr.Zero) return IntPtr.Zero;
         return GetAncestor(h, 2); // GA_ROOT
     }
-    [DllImport("user32.dll", CharSet = CharSet.Auto)]
-    public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr wp, IntPtr lp);
-    [DllImport("user32.dll")]
-    public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
-
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
 
     public static List<IntPtr> Tops() {
@@ -179,26 +182,13 @@ function Normalize-ForOCR([string]$s) {
 
 # ---- capture and OCR a window region ---------------------------------
 function Capture-And-OCR([int]$left, [int]$top, [int]$w, [int]$h) {
-    # Our own always-on-top search box holds the very term we are looking
-    # for, so leaving it visible would let OCR read it back and report a
-    # false match. Go transparent for the duration of the grab.
-    $hidden = $false
-    if ($script:uiForm -and -not $script:uiForm.IsDisposed -and $script:uiForm.Opacity -gt 0) {
-        $script:uiForm.Opacity = 0
-        [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 60
-        $hidden = $true
-    }
-
+    # Do-Search drops our own window behind the grid before calling this,
+    # so the search box (which holds the very term being looked for, and
+    # would otherwise be read back as a false match) is not in the pixels.
     $shot = New-Object System.Drawing.Bitmap($w, $h)
     $g = [System.Drawing.Graphics]::FromImage($shot)
     $g.CopyFromScreen($left, $top, 0, 0, $shot.Size)
     $g.Dispose()
-
-    if ($hidden) {
-        $script:uiForm.Opacity = 1
-        [System.Windows.Forms.Application]::DoEvents()
-    }
 
     $proc = $shot
     if ($Upscale -ne 1.0 -or $Contrast -ne 1.0) {
@@ -371,83 +361,91 @@ function Invoke-RowClick([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [System.Wi
         return $false
     }
 
-    # Our own search box floats above everything, so on the top rows it
-    # would be the thing under the pointer and would eat the click. Drop
-    # out of always-on-top and let the grid come forward first.
-    $wasTop = $false
-    if ($script:uiForm -and -not $script:uiForm.IsDisposed -and $script:uiForm.TopMost) {
-        $script:uiForm.TopMost = $false
-        $wasTop = $true
+    # The grid must be what is actually drawn at that point, so a window
+    # sitting over it cannot swallow the click.
+    if ([Win]::RootAt($screenX, $screenY) -ne $hwnd) {
+        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+        $statusLbl.Text = "Something is covering that row. Not clicking."
+        return $false
     }
-    [Win]::SetForegroundWindow($hwnd) | Out-Null
-    [System.Windows.Forms.Application]::DoEvents()
-    Start-Sleep -Milliseconds 120
 
-    try {
-        # The grid must be what is actually drawn at that point, so a
-        # window sitting over it cannot swallow the click.
-        if ([Win]::RootAt($screenX, $screenY) -ne $hwnd) {
-            $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
-            $statusLbl.Text = "Something is covering that row. Not clicking."
-            return $false
-        }
+    [Win]::SetCursorPos($screenX, $screenY) | Out-Null
+    Start-Sleep -Milliseconds 90
 
-        [Win]::SetCursorPos($screenX, $screenY) | Out-Null
-        Start-Sleep -Milliseconds 90
+    if (-not $AutoClick) { return $true }
 
-        if (-not $AutoClick) { return $true }
-
-        # Confirm the pointer landed where we asked before clicking.
-        $now = New-Object Win+POINT
-        [Win]::GetCursorPos([ref]$now) | Out-Null
-        if ([Math]::Abs($now.X - $screenX) -gt 3 -or [Math]::Abs($now.Y - $screenY) -gt 3) {
-            $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
-            $statusLbl.Text = "Could not position the pointer. Not clicking."
-            return $false
-        }
-
-        $MOUSEEVENTF_LEFTDOWN = 0x0002
-        $MOUSEEVENTF_LEFTUP   = 0x0004
-        [Win]::mouse_event($MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)
-        Start-Sleep -Milliseconds 40
-        [Win]::mouse_event($MOUSEEVENTF_LEFTUP, 0, 0, 0, [IntPtr]::Zero)
-        return $true
+    # Confirm the pointer landed where we asked before clicking.
+    $now = New-Object Win+POINT
+    [Win]::GetCursorPos([ref]$now) | Out-Null
+    if ([Math]::Abs($now.X - $screenX) -gt 3 -or [Math]::Abs($now.Y - $screenY) -gt 3) {
+        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+        $statusLbl.Text = "Could not position the pointer. Not clicking."
+        return $false
     }
-    finally {
-        # Restore z-order only. This does not take focus back from the
-        # grid, so any dialog the click opened stays ready to type into.
-        if ($wasTop -and $script:uiForm -and -not $script:uiForm.IsDisposed) {
-            $script:uiForm.TopMost = $true
-        }
-    }
+
+    $MOUSEEVENTF_LEFTDOWN = 0x0002
+    $MOUSEEVENTF_LEFTUP   = 0x0004
+    [Win]::mouse_event($MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 40
+    [Win]::mouse_event($MOUSEEVENTF_LEFTUP, 0, 0, 0, [IntPtr]::Zero)
+    return $true
 }
 
 # ---- scroll the grid -------------------------------------------------
-function Scroll-GridDown([IntPtr]$hwnd) {
-    $WM_MOUSEWHEEL = 0x020A
-    $WHEEL_DELTA   = -120 * 3
-    $packed = [IntPtr]([int64]($WHEEL_DELTA -shl 16))
-
-    $clientRect = New-Object Win+RECT
-    [Win]::GetClientRect($hwnd, [ref]$clientRect) | Out-Null
-    $pt = New-Object Win+POINT
-    $pt.X = [int](($clientRect.Right - $clientRect.Left) / 2)
-    $pt.Y = [int](($clientRect.Bottom - $clientRect.Top) / 2)
-    [Win]::ClientToScreen($hwnd, [ref]$pt) | Out-Null
-    $lparam = [IntPtr]([int64](($pt.Y -shl 16) -bor ($pt.X -band 0xFFFF)))
-
-    [Win]::PostMessage($hwnd, $WM_MOUSEWHEEL, $packed, $lparam) | Out-Null
+# The rows live in a child control inside the window, so posting
+# WM_MOUSEWHEEL or WM_VSCROLL to the top-level handle scrolls nothing --
+# the messages never reach the control that owns the scrollbar, and we
+# have no reliable way to identify that control in an owner-drawn grid.
+#
+# Instead we park the real mouse pointer over the grid and emit a real
+# wheel event. Windows then routes it to whatever is under the pointer,
+# exactly as if the operator had spun the wheel, so it works regardless
+# of how the grid is built.
+function Get-GridPoint([IntPtr]$hwnd) {
+    $r = New-Object Win+RECT
+    [Win]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+    # 60% down the window, to stay clear of the toolbar and headers.
+    $x = $r.Left + [int](($r.Right  - $r.Left) * 0.5)
+    $y = $r.Top  + [int](($r.Bottom - $r.Top)  * 0.6)
+    return ,@($x, $y)
 }
 
-function Scroll-GridToTop([IntPtr]$hwnd) {
-    $WM_VSCROLL = 0x0115
-    $SB_TOP     = [IntPtr]6
-    [Win]::SendMessage($hwnd, $WM_VSCROLL, $SB_TOP, [IntPtr]::Zero) | Out-Null
+# $notches is positive to scroll up, negative to scroll down.
+function Send-Wheel([IntPtr]$hwnd, [int]$notches) {
+    $MOUSEEVENTF_WHEEL = 0x0800
+    $p = Get-GridPoint $hwnd
+
+    # If the grid is not what sits under that point, a wheel event there
+    # would scroll some other window instead. Say nothing and do nothing.
+    if ([Win]::RootAt($p[0], $p[1]) -ne $hwnd) { return $false }
+
+    [Win]::SetCursorPos($p[0], $p[1]) | Out-Null
+    Start-Sleep -Milliseconds 20
+    [Win]::mouse_event($MOUSEEVENTF_WHEEL, 0, 0, ($notches * 120), [IntPtr]::Zero)
+    return $true
 }
 
 # ---- the main search pipeline ----------------------------------------
-$script:targetHwnd  = [IntPtr]::Zero
-$script:lastHash    = ''
+# Capture the target window and look for the term. Returns the hit, or
+# $null, plus the raw page text so the caller can tell when scrolling has
+# stopped moving.
+function Scan-Once([IntPtr]$hwnd, [string]$term, [float]$scale) {
+    $r = New-Object Win+RECT
+    [Win]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+    $w = $r.Right - $r.Left
+    $h = $r.Bottom - $r.Top
+    if ($w -le 0 -or $h -le 0) { return $null }
+
+    $ocr = Capture-And-OCR $r.Left $r.Top $w $h
+    if (-not $ocr) { return $null }
+
+    return [pscustomobject]@{
+        Hit     = (Search-Screen $ocr $term $scale)
+        Text    = $ocr.Text
+        WinLeft = $r.Left
+        WinTop  = $r.Top
+    }
+}
 
 function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [System.Windows.Forms.Form]$parentForm) {
     if (-not $term) { return }
@@ -458,110 +456,110 @@ function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [Syste
         $statusLbl.Text = "No target window. Pick one from the dropdown."
         return
     }
-    $script:targetHwnd = $hwnd
 
-    # Bring the target forward so nothing is covering the grid we OCR.
-    $SW_RESTORE = 9
-    if ([Win]::IsIconic($hwnd)) {
-        [Win]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
-        Start-Sleep -Milliseconds 250
-    }
-    [Win]::SetForegroundWindow($hwnd) | Out-Null
-    Start-Sleep -Milliseconds 120
+    # Step out of always-on-top and put the grid in front for the whole
+    # search. This is what makes the rest work: our own box is no longer
+    # in the captured pixels, no longer under the pointer when the wheel
+    # is spun, and no longer able to swallow the click.
+    $wasTop = $parentForm.TopMost
+    $parentForm.TopMost = $false
 
-    $rect = New-Object Win+RECT
-    [Win]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
-    $ww = $rect.Right - $rect.Left
-    $wh = $rect.Bottom - $rect.Top
-    if ($ww -le 0 -or $wh -le 0) {
-        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
-        $statusLbl.Text = "IMR window has no usable size."
-        return
-    }
-
-    $winLeft = $rect.Left
-    $winTop  = $rect.Top
-
-    $statusLbl.ForeColor = [System.Drawing.Color]::Black
-    $statusLbl.Text = "Scanning current view..."
-    $parentForm.Refresh()
-
-    $scale = if ($Upscale -ne 1.0) { $Upscale } else { 1.0 }
-    $ocrResult = Capture-And-OCR $winLeft $winTop $ww $wh
-    if (-not $ocrResult) {
-        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
-        $statusLbl.Text = "Windows OCR is not available on this PC."
-        return
-    }
-
-    $hit = Search-Screen $ocrResult $term $scale
-    if ($hit) {
-        $cx = $winLeft + $hit.XLeft + $ClickInsetX
-        $cy = $winTop  + [int](($hit.YTop + $hit.YBot) / 2)
-
-        if (Invoke-RowClick $hwnd $cx $cy $statusLbl) {
-            $statusLbl.ForeColor = [System.Drawing.Color]::ForestGreen
-            $verb = if ($AutoClick) { "Clicked" } else { "Pointer on" }
-            $statusLbl.Text = "$verb`: $($hit.FullText)"
+    try {
+        $SW_RESTORE = 9
+        if ([Win]::IsIconic($hwnd)) {
+            [Win]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
+            Start-Sleep -Milliseconds 250
         }
-        $parentForm.TopMost = $true
-        return
-    }
+        [Win]::SetForegroundWindow($hwnd) | Out-Null
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 150
 
-    # not on this screen, start scrolling
-    $statusLbl.ForeColor = [System.Drawing.Color]::Black
-    $statusLbl.Text = "Not on screen. Scrolling to top..."
-    $parentForm.Refresh()
+        $scale = if ($Upscale -ne 1.0) { $Upscale } else { 1.0 }
 
-    [Win]::SetForegroundWindow($hwnd) | Out-Null
-    Start-Sleep -Milliseconds 80
-    Scroll-GridToTop $hwnd
-    Start-Sleep -Milliseconds $ScrollDelay
-
-    $prevText = ''
-    for ($page = 0; $page -lt $MaxPages; $page++) {
-        [Win]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
-        $winLeft = $rect.Left
-        $winTop  = $rect.Top
-        $ww = $rect.Right - $rect.Left
-        $wh = $rect.Bottom - $rect.Top
-
-        $statusLbl.Text = "Scanning page $($page + 1)..."
-        $parentForm.Refresh()
-
-        $ocrResult = Capture-And-OCR $winLeft $winTop $ww $wh
-        if (-not $ocrResult) { break }
-
-        $currentText = $ocrResult.Text
-        if ($currentText -eq $prevText -and $page -gt 0) {
+        $scan = Scan-Once $hwnd $term $scale
+        if (-not $scan) {
             $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
-            $statusLbl.Text = "Not found after scrolling the whole grid ($($page + 1) pages)."
-            $parentForm.TopMost = $true
+            $statusLbl.Text = "Could not read the window. Is Windows OCR available?"
             return
         }
-        $prevText = $currentText
+        if ($scan.Hit) {
+            Report-Hit $hwnd $scan 0 $statusLbl
+            return
+        }
 
-        $hit = Search-Screen $ocrResult $term $scale
-        if ($hit) {
-            $cx = $winLeft + $hit.XLeft + $ClickInsetX
-            $cy = $winTop  + [int](($hit.YTop + $hit.YBot) / 2)
+        # The row is off-screen. Sweep down to the bottom, then back up
+        # past the starting point to the top. Between them those two
+        # passes cover the whole grid without ever needing to jump to a
+        # known position, which no message we can send would do reliably.
+        $prevText = $scan.Text
+        $total    = 0
 
-            if (Invoke-RowClick $hwnd $cx $cy $statusLbl) {
-                $statusLbl.ForeColor = [System.Drawing.Color]::ForestGreen
-                $verb = if ($AutoClick) { "Clicked" } else { "Pointer on" }
-                $statusLbl.Text = "$verb (page $($page + 1)): $($hit.FullText)"
+        foreach ($dir in @(-1, 1)) {
+            $label = if ($dir -lt 0) { "down" } else { "up" }
+
+            # $MaxPages bounds each pass separately. A long sweep down
+            # must not leave the sweep back up unable to reach the top.
+            for ($step = 0; $step -lt $MaxPages; $step++) {
+                # A long sweep holds the mouse and blocks this thread for
+                # minutes, so leave the operator a way out.
+                if (([Win]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0) {
+                    $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+                    $statusLbl.Text = "Search cancelled."
+                    return
+                }
+
+                $statusLbl.ForeColor = [System.Drawing.Color]::Black
+                $statusLbl.Text = "Searching $label... ($total)"
+
+                if (-not (Send-Wheel $hwnd ($dir * $WheelNotches))) {
+                    $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+                    $statusLbl.Text = "Something is covering the grid. Cannot scroll."
+                    return
+                }
+                Start-Sleep -Milliseconds $ScrollDelay
+                $total++
+
+                $scan = Scan-Once $hwnd $term $scale
+                if (-not $scan) {
+                    $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+                    $statusLbl.Text = "Lost the window while scrolling."
+                    return
+                }
+
+                if ($scan.Hit) {
+                    Report-Hit $hwnd $scan $total $statusLbl
+                    return
+                }
+
+                # Nothing moved, so this end of the grid is reached.
+                if ($scan.Text -eq $prevText) { break }
+                $prevText = $scan.Text
             }
-            $parentForm.TopMost = $true
-            return
+
+            # Force the up pass to run even though the down pass just
+            # ended on a page that stopped changing.
+            $prevText = ''
         }
 
-        Scroll-GridDown $hwnd
-        Start-Sleep -Milliseconds $ScrollDelay
+        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+        $statusLbl.Text = "'$term' not found anywhere in the grid."
     }
+    finally {
+        if ($wasTop) { $parentForm.TopMost = $true }
+    }
+}
 
-    $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
-    $statusLbl.Text = "Not found after $MaxPages pages."
-    $parentForm.TopMost = $true
+function Report-Hit([IntPtr]$hwnd, $scan, [int]$pages, [System.Windows.Forms.Label]$statusLbl) {
+    $hit = $scan.Hit
+    $cx  = $scan.WinLeft + $hit.XLeft + $ClickInsetX
+    $cy  = $scan.WinTop  + [int](($hit.YTop + $hit.YBot) / 2)
+
+    if (Invoke-RowClick $hwnd $cx $cy $statusLbl) {
+        $statusLbl.ForeColor = [System.Drawing.Color]::ForestGreen
+        $verb  = if ($AutoClick) { "Clicked" } else { "Pointer on" }
+        $where = if ($pages -gt 0) { " (after $pages scrolls)" } else { "" }
+        $statusLbl.Text = "$verb$where`: $($hit.FullText)"
+    }
 }
 
 # ---- UI --------------------------------------------------------------
@@ -578,7 +576,6 @@ $form.ShowInTaskbar   = $true
 $form.StartPosition   = 'Manual'
 $form.Location        = New-Object System.Drawing.Point(30, 30)
 $form.BackColor       = [System.Drawing.Color]::White
-$script:uiForm        = $form
 
 # --- target window picker ---
 $lblPage          = New-Object System.Windows.Forms.Label
