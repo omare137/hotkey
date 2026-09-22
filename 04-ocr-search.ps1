@@ -3,9 +3,9 @@
 # ============================================================
 #  A small always-on-top search box. The operator types a part
 #  number, and the tool screenshots the IMR grid, reads it with
-#  the BUILT-IN Windows OCR engine, finds the matching row, and
-#  draws a bright highlight overlay on that row so the operator
-#  knows exactly which line to click.
+#  the BUILT-IN Windows OCR engine, finds the matching row, then
+#  moves the mouse onto that row and clicks it, so IMR selects
+#  the row exactly as if the operator had clicked it themselves.
 #
 #  If the part is not on the current screen, the tool scrolls
 #  the grid one page at a time, re-screenshots, and re-OCRs,
@@ -20,8 +20,12 @@
 #    - does not install anything
 #    - does not modify IMR or its memory
 #    - does not write to any database
-#    - does not click anything in IMR (by default)
-#  It reads pixels, moves the mouse wheel, and draws an overlay.
+#  It reads pixels, moves the mouse, and issues ONE left click on
+#  the matched row. That click is the same input a human hand
+#  would produce. It never types, never presses a button, and
+#  refuses to click at all if the target falls outside the grid
+#  window. Set $AutoClick = $false to only park the pointer on
+#  the row and leave the clicking to the operator.
 #
 #  HOW TO RUN: double-click IMR-Part-Search.bat. That is the
 #  only file you need to open. Pick the window to search from
@@ -41,10 +45,15 @@ $Contrast     = 1.0
 $ScrollDelay  = 200
 # Maximum pages to scroll before giving up.
 $MaxPages     = 200
-# Seconds the highlight overlay stays visible.
-$HighlightSec = 8
 # Fuzzy match: treat common OCR confusable characters as equivalent.
 $FuzzyOCR     = $true
+# Click the matched row automatically. Set to $false to only move the
+# mouse pointer there and let the operator click, which is the safer
+# setting while you are still confirming the tool aims correctly.
+$AutoClick    = $true
+# How far right of the row's leftmost text to click, in pixels. This
+# should land inside the Part Number cell, not on the row edge.
+$ClickInsetX  = 25
 # ================================================
 
 Add-Type -AssemblyName System.Drawing
@@ -72,6 +81,21 @@ public class Win {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, IntPtr extra);
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
+
+    // The top-level window that owns whatever is drawn at this screen
+    // point, or zero if nothing is there.
+    public static IntPtr RootAt(int x, int y) {
+        POINT p; p.X = x; p.Y = y;
+        IntPtr h = WindowFromPoint(p);
+        if (h == IntPtr.Zero) return IntPtr.Zero;
+        return GetAncestor(h, 2); // GA_ROOT
+    }
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr wp, IntPtr lp);
     [DllImport("user32.dll")]
@@ -94,6 +118,13 @@ public class Win {
     }
 }
 "@
+
+# Opt into real screen pixels before any window exists. Without this,
+# Windows virtualises coordinates for this process on a scaled display
+# (125%, 150%), so the pixel the screenshot was taken from and the pixel
+# the mouse is sent to are different points and the click lands on the
+# wrong row. Everything downstream now shares one coordinate space.
+try { [Win]::SetProcessDPIAware() | Out-Null } catch { }
 
 # ---- WinRT / Windows.Media.Ocr plumbing ------------------------------
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -321,33 +352,74 @@ function Search-Screen($ocrResult, [string]$term, [float]$scale) {
     return $null
 }
 
-# ---- highlight overlay -----------------------------------------------
-# A borderless, always-on-top, click-through transparent form that
-# draws a bright box over the found row. Dismisses on timer or keypress.
-function Show-Highlight([int]$screenX, [int]$screenY, [int]$w, [int]$h, [int]$durationMs) {
-    $pad = 4
-    $ov = New-Object System.Windows.Forms.Form
-    $ov.FormBorderStyle = 'None'
-    $ov.TopMost         = $true
-    $ov.ShowInTaskbar   = $false
-    $ov.StartPosition   = 'Manual'
-    $ov.Location        = New-Object System.Drawing.Point(([Math]::Max(0, $screenX - $pad)), ([Math]::Max(0, $screenY - $pad)))
-    $ov.Size            = New-Object System.Drawing.Size(($w + 2*$pad), ($h + 2*$pad))
-    $ov.BackColor       = [System.Drawing.Color]::Yellow
-    $ov.Opacity         = 0.35
-    $ov.Cursor          = [System.Windows.Forms.Cursors]::Hand
+# ---- go to the matched row -------------------------------------------
+# Moves the pointer onto the row and clicks it, so IMR selects the row
+# exactly as if the operator had clicked it themselves.
+#
+# A stray click in IMR could hit Print Labels or Clear, so the target is
+# rejected unless it lies inside the captured window AND that window is
+# what is actually drawn there AND the pointer reached it. Failing any
+# of those we do nothing and say so, rather than click blind.
+function Invoke-RowClick([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [System.Windows.Forms.Label]$statusLbl) {
+    $r = New-Object Win+RECT
+    [Win]::GetWindowRect($hwnd, [ref]$r) | Out-Null
 
-    $timer          = New-Object System.Windows.Forms.Timer
-    $timer.Interval = $durationMs
-    $timer.Add_Tick({ $ov.Close() })
-    $timer.Start()
+    if ($screenX -lt $r.Left -or $screenX -gt $r.Right -or
+        $screenY -lt $r.Top  -or $screenY -gt $r.Bottom) {
+        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+        $statusLbl.Text = "Row found but its position looks wrong. Not clicking."
+        return $false
+    }
 
-    $ov.Add_Click({ $ov.Close() })
-    $ov.Add_KeyPress({ $ov.Close() })
-    $ov.Add_FormClosing({ $timer.Stop(); $timer.Dispose() })
+    # Our own search box floats above everything, so on the top rows it
+    # would be the thing under the pointer and would eat the click. Drop
+    # out of always-on-top and let the grid come forward first.
+    $wasTop = $false
+    if ($script:uiForm -and -not $script:uiForm.IsDisposed -and $script:uiForm.TopMost) {
+        $script:uiForm.TopMost = $false
+        $wasTop = $true
+    }
+    [Win]::SetForegroundWindow($hwnd) | Out-Null
+    [System.Windows.Forms.Application]::DoEvents()
+    Start-Sleep -Milliseconds 120
 
-    $ov.Show()
-    return $ov
+    try {
+        # The grid must be what is actually drawn at that point, so a
+        # window sitting over it cannot swallow the click.
+        if ([Win]::RootAt($screenX, $screenY) -ne $hwnd) {
+            $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+            $statusLbl.Text = "Something is covering that row. Not clicking."
+            return $false
+        }
+
+        [Win]::SetCursorPos($screenX, $screenY) | Out-Null
+        Start-Sleep -Milliseconds 90
+
+        if (-not $AutoClick) { return $true }
+
+        # Confirm the pointer landed where we asked before clicking.
+        $now = New-Object Win+POINT
+        [Win]::GetCursorPos([ref]$now) | Out-Null
+        if ([Math]::Abs($now.X - $screenX) -gt 3 -or [Math]::Abs($now.Y - $screenY) -gt 3) {
+            $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+            $statusLbl.Text = "Could not position the pointer. Not clicking."
+            return $false
+        }
+
+        $MOUSEEVENTF_LEFTDOWN = 0x0002
+        $MOUSEEVENTF_LEFTUP   = 0x0004
+        [Win]::mouse_event($MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 40
+        [Win]::mouse_event($MOUSEEVENTF_LEFTUP, 0, 0, 0, [IntPtr]::Zero)
+        return $true
+    }
+    finally {
+        # Restore z-order only. This does not take focus back from the
+        # grid, so any dialog the click opened stays ready to type into.
+        if ($wasTop -and $script:uiForm -and -not $script:uiForm.IsDisposed) {
+            $script:uiForm.TopMost = $true
+        }
+    }
 }
 
 # ---- scroll the grid -------------------------------------------------
@@ -375,14 +447,9 @@ function Scroll-GridToTop([IntPtr]$hwnd) {
 
 # ---- the main search pipeline ----------------------------------------
 $script:targetHwnd  = [IntPtr]::Zero
-$script:overlayForm = $null
 $script:lastHash    = ''
 
 function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [System.Windows.Forms.Form]$parentForm) {
-    if ($script:overlayForm -and -not $script:overlayForm.IsDisposed) {
-        $script:overlayForm.Close()
-    }
-
     if (-not $term) { return }
 
     $hwnd = Find-TargetWindow
@@ -429,15 +496,14 @@ function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [Syste
 
     $hit = Search-Screen $ocrResult $term $scale
     if ($hit) {
-        $sx = $winLeft + $hit.XLeft
-        $sy = $winTop  + $hit.YTop
-        $sw = $hit.XRight - $hit.XLeft
-        $sh = $hit.YBot   - $hit.YTop
+        $cx = $winLeft + $hit.XLeft + $ClickInsetX
+        $cy = $winTop  + [int](($hit.YTop + $hit.YBot) / 2)
 
-        $script:overlayForm = Show-Highlight $sx $sy $sw $sh ($HighlightSec * 1000)
-
-        $statusLbl.ForeColor = [System.Drawing.Color]::ForestGreen
-        $statusLbl.Text = "Found: $($hit.FullText)"
+        if (Invoke-RowClick $hwnd $cx $cy $statusLbl) {
+            $statusLbl.ForeColor = [System.Drawing.Color]::ForestGreen
+            $verb = if ($AutoClick) { "Clicked" } else { "Pointer on" }
+            $statusLbl.Text = "$verb`: $($hit.FullText)"
+        }
         $parentForm.TopMost = $true
         return
     }
@@ -477,15 +543,14 @@ function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [Syste
 
         $hit = Search-Screen $ocrResult $term $scale
         if ($hit) {
-            $sx = $winLeft + $hit.XLeft
-            $sy = $winTop  + $hit.YTop
-            $sw = $hit.XRight - $hit.XLeft
-            $sh = $hit.YBot   - $hit.YTop
+            $cx = $winLeft + $hit.XLeft + $ClickInsetX
+            $cy = $winTop  + [int](($hit.YTop + $hit.YBot) / 2)
 
-            $script:overlayForm = Show-Highlight $sx $sy $sw $sh ($HighlightSec * 1000)
-
-            $statusLbl.ForeColor = [System.Drawing.Color]::ForestGreen
-            $statusLbl.Text = "Found on page $($page + 1): $($hit.FullText)"
+            if (Invoke-RowClick $hwnd $cx $cy $statusLbl) {
+                $statusLbl.ForeColor = [System.Drawing.Color]::ForestGreen
+                $verb = if ($AutoClick) { "Clicked" } else { "Pointer on" }
+                $statusLbl.Text = "$verb (page $($page + 1)): $($hit.FullText)"
+            }
             $parentForm.TopMost = $true
             return
         }
@@ -694,9 +759,6 @@ $hotTimer.Start()
 
 $form.Add_FormClosing({
     $hotTimer.Stop()
-    if ($script:overlayForm -and -not $script:overlayForm.IsDisposed) {
-        $script:overlayForm.Close()
-    }
 })
 
 $form.Add_Shown({

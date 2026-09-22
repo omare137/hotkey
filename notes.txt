@@ -28,6 +28,12 @@ If 01-probe.ps1 reports NOT BUILDABLE, or rows show up but the text is blank:
 4. Check the output: are part numbers readable?
    - Clean -> proceed to step 5.
    - Mangled -> raise $Upscale to 3 or $Contrast to 1.4 and re-run.
-5. Paste 04-ocr-search.ps1 into PowerShell.
-6. Type a part number, press Enter. Yellow highlight appears on the row.
-7. Click the row in IMR underneath the highlight.
+5. Double-click IMR-Part-Search.bat. One file, nothing else to start.
+6. Pick the grid window in the "Page to search" dropdown, or leave it
+   on (auto) to match any window titled "Incoming".
+7. Type a part number, press Enter. The tool finds the row, moves the
+   mouse onto it, and clicks it, so IMR selects that row.
+
+While confirming it aims correctly, set $AutoClick = $false in the
+CONFIG block. It then only parks the pointer on the row and clicks
+nothing.

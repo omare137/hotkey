@@ -49,8 +49,8 @@ something to read.
 - Searches the recognised text for the part number
 - If not on screen, scrolls one page and re-scans, repeating until found
   or the bottom is reached
-- Draws a bright yellow translucent overlay on the matching row so the
-  operator knows exactly which line to click
+- Moves the mouse onto the matching row and clicks it, selecting that
+  row in IMR
 
 **Hard constraint:** stock Windows only. No Tesseract, no Python, no
 installs. Only `System.Drawing`, `System.Windows.Forms`, and
@@ -65,7 +65,7 @@ installs. Only `System.Drawing`, `System.Windows.Forms`, and
 | `01-probe.ps1` | MSAA approach: read-only probe, reports whether the grid is readable and prints config values |
 | `02-part-search.ps1` | MSAA approach: always-on-top search box, finds and selects the matching row |
 | `03-ocr-spike.ps1` | OCR approach: Phase 0 feasibility test — screenshots the grid, runs Windows OCR once, prints raw results |
-| `04-ocr-search.ps1` | OCR approach: full search tool with window picker, scrolling and highlight overlay |
+| `04-ocr-search.ps1` | OCR approach: full search tool with window picker, scrolling, and click-the-row |
 | `Test-Grid.ps1` | A fake 25-row grid for trying the tool without IMR. Launched from the **Test grid** button, no need to run it yourself |
 
 ### Double-click launchers
@@ -166,16 +166,38 @@ Then type a part number and press Enter. The tool:
 - Hides its own search box (so OCR can't read the term back and
   false-match on it), screenshots the window, and runs OCR
 - If the part isn't on screen, scrolls the grid and re-scans
-- Draws a yellow highlight overlay on the matching row
-
-The overlay lasts 8 seconds (configurable via `$HighlightSec`) and can
-be clicked or dismissed with any key. The operator clicks the row in
-IMR underneath it.
+- **Moves the mouse onto the matching row and clicks it**, so IMR
+  selects that row exactly as if you had clicked it by hand
 
 - **Fuzzy OCR** (`$FuzzyOCR = $true`) — treats common OCR confusable
   characters (0/O, 1/I/l, 5/S, 8/B) as equivalent when matching
 - **Shrink** — collapses to just the picker and the search box
 - **Ctrl+Shift+F** — recalls the window from anywhere
+
+### About the click
+
+A misplaced click in IMR could hit *Print Labels* or *Clear*, so the
+click is guarded three ways. It is skipped, with a message, unless:
+
+1. The target point lies inside the window that was captured.
+2. That window is genuinely the thing drawn at that point — nothing is
+   covering it.
+3. The pointer actually reached the requested position.
+
+The tool issues exactly one left click and nothing else. It never
+types and never presses a button.
+
+**While you are still confirming it aims correctly, set
+`$AutoClick = $false`** in the CONFIG block. The tool then only parks
+the mouse pointer on the row it found and leaves the clicking to you —
+all the benefit of the search, none of the risk of a stray click.
+
+> **Coordinates and display scaling.** The script calls
+> `SetProcessDPIAware()` at startup so the pixel it screenshots and the
+> pixel it clicks are the same point. Without that, Windows virtualises
+> coordinates on a scaled display (125%, 150%) and the aim drifts down
+> the grid. If you ever see it miss by a consistent number of rows,
+> display scaling is the first thing to suspect.
 
 ---
 
@@ -184,8 +206,16 @@ IMR underneath it.
 - **Unsupported.** Siemens did not sanction this. It is a workaround.
 - **Fragile to updates.** It depends on IMR's window layout. An update
   can break it with no warning.
-- **Operator aid only.** It reads the screen and highlights a row. It
-  deliberately does not click, save, or print.
+- **It clicks.** The OCR tool moves the mouse and left-clicks the row
+  it matched, which is a real input event — the same one a hand would
+  produce. It selects a row and nothing more: it never types, never
+  saves, and never presses Print. Set `$AutoClick = $false` to reduce
+  it to a pointer aid that clicks nothing.
+- **A wrong match means a wrong row selected.** OCR can misread a
+  character. The guards stop the click landing outside the grid, but
+  they cannot tell a correctly-aimed click on the wrong row from a
+  right one. The operator should still confirm the selected row before
+  acting on it.
 - **Per machine.** It runs on each PC where needed. Nothing installed,
   but the file must be available there.
 - **OCR approach is slower.** A few seconds per screen, plus scrolling
@@ -199,8 +229,10 @@ IMR underneath it.
 ## What to tell quality / IT
 
 This tool reads the screen and (in OCR mode) moves the mouse wheel and
-draws an overlay. It does not read the database, does not read IMR's
-memory, and does not modify IMR or any data. It uses only software that
+the mouse pointer, and issues a single left click to select the row it
+found — the same input an operator's hand produces, and nothing beyond
+it. It does not read the database, does not read IMR's memory, and does
+not modify IMR or any data. It uses only software that
 ships with a standard Windows PC — the built-in OCR engine and built-in
 .NET, run from the PowerShell that is already on the machine. Nothing is
 installed or downloaded; the only thing placed on the workstation is the
