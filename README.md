@@ -25,98 +25,167 @@ Checked against the Siemens 2410 manuals for IPL:
 | IPL Searcher | Separate application | No documented link back into IMR's registration dialog. |
 | Vendor change | Declined | Software provider said they cannot do anything. |
 
-## What this is instead
+## Two approaches
 
-A small always-on-top window running alongside IMR. It reads IMR's grid
-through the Windows accessibility layer (the same layer screen readers
-use), finds the matching row, and moves IMR's selection to it. The
-operator then clicks the row and continues as normal.
+### Approach A — MSAA accessibility (scripts 01 & 02)
 
-It does not install anything, modify IMR, or touch the database.
+Uses the Windows accessibility layer (oleacc.dll MSAA) to read the grid
+text and move the selection. Works perfectly on standard WinForms grids.
 
-**Proven on a test grid:** all rows were readable from outside the
-program, including rows scrolled out of view, and the selection moved
-correctly. Whether real IMR behaves the same is what step 1 below
-determines.
+**Limitation:** IMR's grid may be owner-drawn, meaning it paints the cell
+text itself and the accessibility layer returns empty strings even though
+it can count the rows. If the probe (01) reports BUILDABLE and shows real
+data, use this approach — it is faster and simpler.
+
+### Approach B — OCR (scripts 03 & 04)
+
+Falls back to screenshotting the grid and reading it with the **built-in
+Windows OCR engine** (`Windows.Media.Ocr`). This is the fallback when
+MSAA returns no text — the app must paint the pixels, so OCR always has
+something to read.
+
+- Screenshots the grid region
+- Upscales and optionally boosts contrast before OCR
+- Searches the recognised text for the part number
+- If not on screen, scrolls one page and re-scans, repeating until found
+  or the bottom is reached
+- Draws a bright yellow translucent overlay on the matching row so the
+  operator knows exactly which line to click
+
+**Hard constraint:** stock Windows only. No Tesseract, no Python, no
+installs. Only `System.Drawing`, `System.Windows.Forms`, and
+`Windows.Media.Ocr` as they ship on Windows 10/11.
 
 ---
 
-## Step 1 — probe (read only, 5 minutes)
+## Files
+
+| File | What it does |
+|---|---|
+| `01-probe.ps1` | MSAA approach: read-only probe, reports whether the grid is readable and prints config values |
+| `02-part-search.ps1` | MSAA approach: always-on-top search box, finds and selects the matching row |
+| `03-ocr-spike.ps1` | OCR approach: Phase 0 feasibility test — screenshots the grid, runs Windows OCR once, prints raw results |
+| `04-ocr-search.ps1` | OCR approach: full search tool with scrolling and highlight overlay |
+
+---
+
+## Which approach to use
+
+1. Run `01-probe.ps1` first. If it reports **BUILDABLE** with real row
+   data, use `02-part-search.ps1` — it is instant and reliable.
+2. If the probe reports **NOT BUILDABLE**, or shows rows with empty text,
+   switch to the OCR path.
+3. Run `03-ocr-spike.ps1` to confirm the OCR engine can read the part
+   numbers cleanly.
+4. If the spike passes, use `04-ocr-search.ps1` for daily operation.
+
+---
+
+## Step-by-step: MSAA approach (01 → 02)
 
 1. Open IMR and load an order so the part number table has rows on screen.
 2. Open Windows PowerShell: Start menu, type `powershell`, press Enter.
 3. Open `01-probe.ps1` in Notepad. Ctrl+A, Ctrl+C.
 4. Right click inside the PowerShell window to paste. Press Enter.
 
-Do not double click the .ps1 file. Windows blocks that by default.
-Copy and paste is the way around it.
-
-### Reading the result
+### Reading the probe result
 
 **`RESULT: BUILDABLE`** — the grid is readable. It prints the three
-config values for step 2, plus the row count. Continue.
+config values for step 2, plus the row count. Continue to `02-part-search.ps1`.
 
-**`RESULT: NOT BUILDABLE`** — no control exposed more than 3 rows. IMR's
-grid is custom drawn, Windows cannot read it, and no external tool can.
-This is a definite answer. Stop here and report it.
+**`RESULT: NOT BUILDABLE`** — no control exposed more than 3 rows. Switch
+to the OCR approach (03 → 04).
 
-**`Could not find a window matching`** — it lists the open windows.
-Find IMR, take a distinctive word from its title, and change the
-`$WindowMatch` line at the top of the file. Run again.
-
-### One thing to check either way
-
-The probe reports how many rows the grid exposed. Compare that to how
-many parts are actually in the order you loaded.
-
-- Same number → all rows readable, search is instant.
-- Much smaller → only on-screen rows are exposed. The tool needs a
-  scrolling mode, which is slower but still works. Report the two numbers.
-
----
-
-## Step 2 — the tool
+### Running the search (02)
 
 1. Open `02-part-search.ps1` in Notepad.
 2. In the CONFIG block near the top, set the three values the probe printed.
 3. Save.
-4. With IMR open and an order loaded, paste the file into PowerShell the
-   same way as before.
+4. With IMR open and an order loaded, paste the file into PowerShell.
 
-A small box appears in the top left. Type or scan a part number, press
-Enter. IMR jumps to that row and selects it.
+A small box appears. Type or scan a part number, press Enter. IMR jumps
+to that row and selects it.
 
-- **Next** — steps through multiple matches when searching a partial
-  number like `CAP`.
-- **Reload grid** — press after loading a different order, so it
-  re-reads the new rows.
-- **Scroll mode** — tick this only if the probe reported far fewer rows
-  than the order actually contains. Instead of reading everything up
-  front, it pages the grid from the top and checks each screenful until
-  it finds a match. Slower, a second or two on a long order, but it
-  reaches rows that are not otherwise exposed. Leave it off if the row
-  counts matched; normal mode is instant.
-- **Shrink** — collapses the window down to just the search box.
-- **Minimize** — normal minimize button, sends it to the taskbar.
-- **Ctrl + Shift + F** — brings it back from minimized and puts the
-  cursor in the box, from anywhere. Works while IMR has focus, so the
-  operator never has to go hunting for the taskbar.
+- **Next** — steps through multiple matches for partial searches
+- **Reload grid** — press after loading a different order
+- **Scroll mode** — tick if the probe reported fewer rows than the order
+  actually contains
+- **Shrink** — collapses the window to just the search box
+- **Ctrl+Shift+F** — brings it back from minimized, from anywhere
+
+---
+
+## Step-by-step: OCR approach (03 → 04)
+
+### Phase 0 — feasibility spike (03)
+
+1. Open IMR with an order loaded.
+2. Open `03-ocr-spike.ps1` in Notepad. Ctrl+A, Ctrl+C.
+3. Right click inside PowerShell to paste. Press Enter.
+4. You get a 4-second countdown — click the IMR window during it.
+5. The script screenshots the window, runs OCR, and prints every word
+   it found, with bounding boxes.
+
+**What to check:** find a real part number in the output. Is it intact,
+or are characters swapped (0/O, 1/I/l, 5/S, 8/B)?
+
+- **Clean** — the project is viable. Use `04-ocr-search.ps1`.
+- **Mangled** — raise `$Upscale` to 3, or set `$Contrast` to 1.4, and
+  run again. Stay inside stock Windows.
+
+The spike saves the captured image to `%TEMP%\imr-ocr-spike.png` so you
+can see exactly what OCR saw.
+
+### Running the search (04)
+
+1. Open `04-ocr-search.ps1` in Notepad.
+2. Adjust the CONFIG block if needed (`$WindowMatch`, `$Upscale`,
+   `$Contrast`).
+3. Paste into PowerShell with IMR open.
+
+A small box appears. Type a part number, press Enter. The tool:
+- Screenshots the IMR window
+- Runs OCR
+- If the part isn't on screen, scrolls the grid and re-scans
+- Draws a yellow highlight overlay on the matching row
+
+The overlay lasts 8 seconds (configurable via `$HighlightSec`) and can
+be clicked or dismissed with any key. The operator clicks the row in
+IMR underneath it.
+
+- **Fuzzy OCR** (`$FuzzyOCR = $true`) — treats common OCR confusable
+  characters (0/O, 1/I/l, 5/S, 8/B) as equivalent when matching
+- **Shrink** — collapses the window
+- **Ctrl+Shift+F** — recalls the window from anywhere
 
 ---
 
 ## Honest caveats
 
-State these up front rather than after.
-
 - **Unsupported.** Siemens did not sanction this. It is a workaround.
-- **Fragile to updates.** It depends on IMR's internal window structure.
-  An IMR update can break it with no warning. Whoever inherits it needs
-  to know that, otherwise a future outage looks mysterious.
-- **Operator aid only.** It reads the screen and moves the selection. It
-  deliberately does not click, save, or print. Every action that changes
-  data stays with the operator.
-- **Per machine.** It runs on each PC where it is needed. Nothing is
-  installed, but the file has to be available there.
+- **Fragile to updates.** It depends on IMR's window layout. An update
+  can break it with no warning.
+- **Operator aid only.** It reads the screen and highlights a row. It
+  deliberately does not click, save, or print.
+- **Per machine.** It runs on each PC where needed. Nothing installed,
+  but the file must be available there.
+- **OCR approach is slower.** A few seconds per screen, plus scrolling
+  time for long orders. Fine for typical use.
+- **OCR approach depends on screen rendering.** Zoom changes, DPI
+  changes, or theme changes can affect accuracy. Re-run the spike (03)
+  after any such change.
+
+---
+
+## What to tell quality / IT
+
+This tool reads the screen and (in OCR mode) moves the mouse wheel and
+draws an overlay. It does not read the database, does not read IMR's
+memory, and does not modify IMR or any data. It uses only software that
+ships with a standard Windows PC — the built-in OCR engine and built-in
+.NET, run from the PowerShell that is already on the machine. Nothing is
+installed or downloaded; the only thing placed on the workstation is the
+script file itself.
 
 ---
 
@@ -126,9 +195,7 @@ Both cost nothing and may remove the problem entirely.
 
 1. **Shorten the purchase orders.** The list being scrolled is the line
    items of one loaded PO. If POs arrive with hundreds of lines,
-   splitting them at the ERP/SAP end (one per delivery, pallet, or
-   supplier) collapses the scroll. This is a process change, not a
-   software one.
+   splitting them at the ERP/SAP end collapses the scroll.
 
 2. **Check whether the Part Number column header sorts.** Not documented
    for IMR, but it is documented for the Storage app. One click to test.
@@ -136,9 +203,6 @@ Both cost nothing and may remove the problem entirely.
 ## Also worth asking
 
 3. Open **Component Manager** on the IMR PC. Is **IPL Searcher** in the
-   list of available applications? If it is, the component exists on site
-   and only needs a Resource ID configured. If not, it was never installed.
+   list of available applications?
 
-4. Can we get a KeyCloak `ipl_user` account? Read only, GET calls only,
-   and per the API guide it requires no additional software installed on
-   the server. Useful regardless of which direction this goes.
+4. Can we get a KeyCloak `ipl_user` account? Read only, GET calls only.
