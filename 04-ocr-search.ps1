@@ -199,20 +199,33 @@ function Find-TargetWindow {
 function Group-IntoRows($ocrResult, [float]$scale) {
     $items = @()
     foreach ($line in $ocrResult.Lines) {
-        $lineText = ($line.Words | ForEach-Object { $_.Text }) -join ' '
-        $yCenter  = ($line.Words[0].BoundingRect.Y + $line.Words[0].BoundingRect.Height / 2) / $scale
-        $yTop     = $line.Words[0].BoundingRect.Y / $scale
-        $yBot     = ($line.Words[0].BoundingRect.Y + $line.Words[0].BoundingRect.Height) / $scale
-        $xLeft    = $line.Words[0].BoundingRect.X / $scale
-        $xRight   = ($line.Words[-1].BoundingRect.X + $line.Words[-1].BoundingRect.Width) / $scale
+        $words = @($line.Words)
+        if ($words.Count -eq 0) { continue }
+        $lineText = ($words | ForEach-Object { $_.Text }) -join ' '
+
+        $minX = [double]::MaxValue
+        $maxX = 0.0
+        $minY = [double]::MaxValue
+        $maxY = 0.0
+        foreach ($w in $words) {
+            $br = $w.BoundingRect
+            $wx = [double]$br.X
+            $wy = [double]$br.Y
+            $ww = [double]$br.Width
+            $wh = [double]$br.Height
+            if ($wx -lt $minX) { $minX = $wx }
+            if (($wx + $ww) -gt $maxX) { $maxX = $wx + $ww }
+            if ($wy -lt $minY) { $minY = $wy }
+            if (($wy + $wh) -gt $maxY) { $maxY = $wy + $wh }
+        }
 
         $items += [pscustomobject]@{
             Text    = $lineText
-            YCenter = $yCenter
-            YTop    = $yTop
-            YBot    = $yBot
-            XLeft   = $xLeft
-            XRight  = $xRight
+            YCenter = (($minY + $maxY) / 2) / $scale
+            YTop    = $minY / $scale
+            YBot    = $maxY / $scale
+            XLeft   = $minX / $scale
+            XRight  = $maxX / $scale
         }
     }
 
