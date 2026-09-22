@@ -23,9 +23,11 @@
 #    - does not click anything in IMR (by default)
 #  It reads pixels, moves the mouse wheel, and draws an overlay.
 #
-#  HOW TO RUN: open Windows PowerShell, open this file in
-#  Notepad, Ctrl+A, Ctrl+C, right click inside the PowerShell
-#  window and press Enter.
+#  HOW TO RUN: double-click IMR-Part-Search.bat. That is the
+#  only file you need to open. Pick the window to search from
+#  the dropdown at the top (or leave it on auto), type a part
+#  number, press Enter. The "Test grid" button opens a sample
+#  grid so you can try it without IMR.
 # ============================================================
 
 # ==================== CONFIG ====================
@@ -65,6 +67,9 @@ public class Win {
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr p);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
@@ -143,10 +148,26 @@ function Normalize-ForOCR([string]$s) {
 
 # ---- capture and OCR a window region ---------------------------------
 function Capture-And-OCR([int]$left, [int]$top, [int]$w, [int]$h) {
+    # Our own always-on-top search box holds the very term we are looking
+    # for, so leaving it visible would let OCR read it back and report a
+    # false match. Go transparent for the duration of the grab.
+    $hidden = $false
+    if ($script:uiForm -and -not $script:uiForm.IsDisposed -and $script:uiForm.Opacity -gt 0) {
+        $script:uiForm.Opacity = 0
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 60
+        $hidden = $true
+    }
+
     $shot = New-Object System.Drawing.Bitmap($w, $h)
     $g = [System.Drawing.Graphics]::FromImage($shot)
     $g.CopyFromScreen($left, $top, 0, 0, $shot.Size)
     $g.Dispose()
+
+    if ($hidden) {
+        $script:uiForm.Opacity = 1
+        [System.Windows.Forms.Application]::DoEvents()
+    }
 
     $proc = $shot
     if ($Upscale -ne 1.0 -or $Contrast -ne 1.0) {
@@ -184,10 +205,38 @@ function Capture-And-OCR([int]$left, [int]$top, [int]$w, [int]$h) {
     return $result
 }
 
-# ---- find IMR window -------------------------------------------------
-function Find-TargetWindow {
+# ---- window picking --------------------------------------------------
+# The operator picks the target window from a dropdown. Until they pick
+# one, we fall back to matching the title against $WindowMatch so the
+# tool still works out of the box on a normal IMR desktop.
+$script:pickedHwnd = [IntPtr]::Zero
+
+function Get-PickableWindows {
+    $list = @()
     foreach ($h in [Win]::Tops()) {
         $ti = [Win]::Title($h)
+        if (-not $ti) { continue }
+        if ($ti -eq $script:selfTitle) { continue }
+
+        $r = New-Object Win+RECT
+        [Win]::GetWindowRect($h, [ref]$r) | Out-Null
+        if (($r.Right - $r.Left) -lt 120 -or ($r.Bottom - $r.Top) -lt 80) { continue }
+
+        $list += [pscustomobject]@{
+            Hwnd  = $h
+            Title = $ti
+        }
+    }
+    return $list
+}
+
+function Find-TargetWindow {
+    if ($script:pickedHwnd -ne [IntPtr]::Zero -and [Win]::IsWindow($script:pickedHwnd)) {
+        return $script:pickedHwnd
+    }
+    foreach ($h in [Win]::Tops()) {
+        $ti = [Win]::Title($h)
+        if ($ti -and $ti -eq $script:selfTitle) { continue }
         if ($ti -and $ti -match $WindowMatch) { return $h }
     }
     return [IntPtr]::Zero
@@ -199,20 +248,33 @@ function Find-TargetWindow {
 function Group-IntoRows($ocrResult, [float]$scale) {
     $items = @()
     foreach ($line in $ocrResult.Lines) {
-        $lineText = ($line.Words | ForEach-Object { $_.Text }) -join ' '
-        $yCenter  = ($line.Words[0].BoundingRect.Y + $line.Words[0].BoundingRect.Height / 2) / $scale
-        $yTop     = $line.Words[0].BoundingRect.Y / $scale
-        $yBot     = ($line.Words[0].BoundingRect.Y + $line.Words[0].BoundingRect.Height) / $scale
-        $xLeft    = $line.Words[0].BoundingRect.X / $scale
-        $xRight   = ($line.Words[-1].BoundingRect.X + $line.Words[-1].BoundingRect.Width) / $scale
+        $words = @($line.Words)
+        if ($words.Count -eq 0) { continue }
+        $lineText = ($words | ForEach-Object { $_.Text }) -join ' '
+
+        $minX = [double]::MaxValue
+        $maxX = 0.0
+        $minY = [double]::MaxValue
+        $maxY = 0.0
+        foreach ($w in $words) {
+            $br = $w.BoundingRect
+            $wx = [double]$br.X
+            $wy = [double]$br.Y
+            $ww = [double]$br.Width
+            $wh = [double]$br.Height
+            if ($wx -lt $minX) { $minX = $wx }
+            if (($wx + $ww) -gt $maxX) { $maxX = $wx + $ww }
+            if ($wy -lt $minY) { $minY = $wy }
+            if (($wy + $wh) -gt $maxY) { $maxY = $wy + $wh }
+        }
 
         $items += [pscustomobject]@{
             Text    = $lineText
-            YCenter = $yCenter
-            YTop    = $yTop
-            YBot    = $yBot
-            XLeft   = $xLeft
-            XRight  = $xRight
+            YCenter = (($minY + $maxY) / 2) / $scale
+            YTop    = $minY / $scale
+            YBot    = $maxY / $scale
+            XLeft   = $minX / $scale
+            XRight  = $maxX / $scale
         }
     }
 
@@ -326,10 +388,19 @@ function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [Syste
     $hwnd = Find-TargetWindow
     if ($hwnd -eq [IntPtr]::Zero) {
         $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
-        $statusLbl.Text = "IMR window not found. Is it open?"
+        $statusLbl.Text = "No target window. Pick one from the dropdown."
         return
     }
     $script:targetHwnd = $hwnd
+
+    # Bring the target forward so nothing is covering the grid we OCR.
+    $SW_RESTORE = 9
+    if ([Win]::IsIconic($hwnd)) {
+        [Win]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
+        Start-Sleep -Milliseconds 250
+    }
+    [Win]::SetForegroundWindow($hwnd) | Out-Null
+    Start-Sleep -Milliseconds 120
 
     $rect = New-Object Win+RECT
     [Win]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
@@ -429,9 +500,11 @@ function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [Syste
 }
 
 # ---- UI --------------------------------------------------------------
+$script:selfTitle = "Find Part  (OCR)   Ctrl+Shift+F to recall"
+
 $form                 = New-Object System.Windows.Forms.Form
-$form.Text            = "Find Part  (OCR)   Ctrl+Shift+F to recall"
-$form.Size            = New-Object System.Drawing.Size(430, 180)
+$form.Text            = $script:selfTitle
+$form.Size            = New-Object System.Drawing.Size(430, 232)
 $form.TopMost         = $true
 $form.FormBorderStyle = 'FixedSingle'
 $form.MinimizeBox     = $true
@@ -440,41 +513,136 @@ $form.ShowInTaskbar   = $true
 $form.StartPosition   = 'Manual'
 $form.Location        = New-Object System.Drawing.Point(30, 30)
 $form.BackColor       = [System.Drawing.Color]::White
+$script:uiForm        = $form
 
+# --- target window picker ---
+$lblPage          = New-Object System.Windows.Forms.Label
+$lblPage.Text     = "Page to search:"
+$lblPage.Location = New-Object System.Drawing.Point(12, 14)
+$lblPage.Size     = New-Object System.Drawing.Size(95, 20)
+$lblPage.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$form.Controls.Add($lblPage)
+
+$cmbWindow           = New-Object System.Windows.Forms.ComboBox
+$cmbWindow.Location  = New-Object System.Drawing.Point(108, 11)
+$cmbWindow.Size      = New-Object System.Drawing.Size(230, 24)
+$cmbWindow.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
+$cmbWindow.DropDownStyle = 'DropDownList'
+$cmbWindow.DropDownWidth = 520
+$form.Controls.Add($cmbWindow)
+
+$btnRefresh          = New-Object System.Windows.Forms.Button
+$btnRefresh.Text     = "Refresh"
+$btnRefresh.Location = New-Object System.Drawing.Point(344, 10)
+$btnRefresh.Size     = New-Object System.Drawing.Size(62, 25)
+$btnRefresh.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
+$form.Controls.Add($btnRefresh)
+
+# --- search box ---
 $txt          = New-Object System.Windows.Forms.TextBox
-$txt.Location = New-Object System.Drawing.Point(12, 14)
+$txt.Location = New-Object System.Drawing.Point(12, 46)
 $txt.Size     = New-Object System.Drawing.Size(285, 32)
 $txt.Font     = New-Object System.Drawing.Font("Segoe UI", 14)
 $form.Controls.Add($txt)
 
 $btnSearch          = New-Object System.Windows.Forms.Button
 $btnSearch.Text     = "Search"
-$btnSearch.Location = New-Object System.Drawing.Point(306, 13)
-$btnSearch.Size     = New-Object System.Drawing.Size(75, 33)
+$btnSearch.Location = New-Object System.Drawing.Point(306, 45)
+$btnSearch.Size     = New-Object System.Drawing.Size(100, 33)
 $form.Controls.Add($btnSearch)
 
 $btnSlim          = New-Object System.Windows.Forms.Button
 $btnSlim.Text     = "Shrink"
-$btnSlim.Location = New-Object System.Drawing.Point(12, 54)
+$btnSlim.Location = New-Object System.Drawing.Point(12, 86)
 $btnSlim.Size     = New-Object System.Drawing.Size(65, 26)
 $btnSlim.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
 $form.Controls.Add($btnSlim)
 
+$btnTestGrid          = New-Object System.Windows.Forms.Button
+$btnTestGrid.Text     = "Test grid"
+$btnTestGrid.Location = New-Object System.Drawing.Point(83, 86)
+$btnTestGrid.Size     = New-Object System.Drawing.Size(70, 26)
+$btnTestGrid.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
+$form.Controls.Add($btnTestGrid)
+
 $hint          = New-Object System.Windows.Forms.Label
 $hint.Text     = "Type a part number and press Enter"
-$hint.Location = New-Object System.Drawing.Point(86, 58)
-$hint.Size     = New-Object System.Drawing.Size(300, 20)
+$hint.Location = New-Object System.Drawing.Point(160, 90)
+$hint.Size     = New-Object System.Drawing.Size(250, 20)
 $hint.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
 $hint.ForeColor = [System.Drawing.Color]::Gray
 $form.Controls.Add($hint)
 
 $lbl          = New-Object System.Windows.Forms.Label
-$lbl.Location = New-Object System.Drawing.Point(12, 88)
-$lbl.Size     = New-Object System.Drawing.Size(400, 52)
+$lbl.Location = New-Object System.Drawing.Point(12, 120)
+$lbl.Size     = New-Object System.Drawing.Size(400, 62)
 $lbl.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 $form.Controls.Add($lbl)
 
 function Say([string]$m, $c) { $lbl.ForeColor = $c; $lbl.Text = $m; $form.Refresh() }
+
+# ---- populate the window picker --------------------------------------
+# The combo holds plain strings and $script:pickHandles holds the matching
+# handles at the same index, so the selection survives duplicate titles.
+# Index 0 is always the auto-match fallback.
+$script:pickHandles = @([IntPtr]::Zero)
+
+function Refresh-WindowList {
+    $prev = $script:pickedHwnd
+
+    $cmbWindow.Items.Clear()
+    $script:pickHandles = @([IntPtr]::Zero)
+    $null = $cmbWindow.Items.Add("(auto) any window titled '$WindowMatch'")
+
+    foreach ($w in Get-PickableWindows) {
+        $t = $w.Title
+        if ($t.Length -gt 90) { $t = $t.Substring(0, 90) + '...' }
+        $null = $cmbWindow.Items.Add($t)
+        $script:pickHandles += $w.Hwnd
+    }
+
+    $idx = 0
+    if ($prev -ne [IntPtr]::Zero) {
+        for ($i = 1; $i -lt $script:pickHandles.Count; $i++) {
+            if ($script:pickHandles[$i] -eq $prev) { $idx = $i; break }
+        }
+    }
+    $cmbWindow.SelectedIndex = $idx
+}
+
+$cmbWindow.Add_SelectedIndexChanged({
+    $i = $cmbWindow.SelectedIndex
+    if ($i -ge 0 -and $i -lt $script:pickHandles.Count) {
+        $script:pickedHwnd = $script:pickHandles[$i]
+    }
+})
+
+$btnRefresh.Add_Click({
+    Refresh-WindowList
+    Say "Window list refreshed." ([System.Drawing.Color]::Black)
+})
+
+# ---- launch the bundled test grid ------------------------------------
+$btnTestGrid.Add_Click({
+    $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $gridPath = Join-Path $root 'Test-Grid.ps1'
+    if (-not (Test-Path $gridPath)) {
+        Say "Test-Grid.ps1 not found next to this script." ([System.Drawing.Color]::Firebrick)
+        return
+    }
+    Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $gridPath)
+    Start-Sleep -Milliseconds 1200
+    Refresh-WindowList
+
+    for ($i = 1; $i -lt $cmbWindow.Items.Count; $i++) {
+        if ($cmbWindow.Items[$i] -like '*Test Grid*') { $cmbWindow.SelectedIndex = $i; break }
+    }
+
+    Say "Test grid opened and selected. Try KELECRES-1006483A0." ([System.Drawing.Color]::ForestGreen)
+    $form.TopMost = $true
+    $txt.Focus()
+})
 
 $doFind = {
     $term = $txt.Text.Trim()
@@ -491,11 +659,11 @@ $btnSearch.Add_Click({ & $doFind })
 $script:slim = $false
 $btnSlim.Add_Click({
     if ($script:slim) {
-        $form.Size = New-Object System.Drawing.Size(430, 180)
+        $form.Size = New-Object System.Drawing.Size(430, 232)
         $btnSlim.Text = "Shrink"
         $script:slim = $false
     } else {
-        $form.Size = New-Object System.Drawing.Size(430, 72)
+        $form.Size = New-Object System.Drawing.Size(430, 124)
         $btnSlim.Text = "Expand"
         $script:slim = $true
     }
@@ -532,10 +700,11 @@ $form.Add_FormClosing({
 })
 
 $form.Add_Shown({
+    Refresh-WindowList
     $txt.Focus()
     $eng = Get-OcrEngine
     if ($eng) {
-        Say "Ready. OCR engine loaded." ([System.Drawing.Color]::ForestGreen)
+        Say "Ready. Pick the page to search, type a part number, press Enter." ([System.Drawing.Color]::ForestGreen)
     } else {
         Say "Windows OCR is not available on this PC.`nSettings > Apps > Optional features > English OCR." ([System.Drawing.Color]::Firebrick)
     }

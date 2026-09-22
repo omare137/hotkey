@@ -65,7 +65,17 @@ installs. Only `System.Drawing`, `System.Windows.Forms`, and
 | `01-probe.ps1` | MSAA approach: read-only probe, reports whether the grid is readable and prints config values |
 | `02-part-search.ps1` | MSAA approach: always-on-top search box, finds and selects the matching row |
 | `03-ocr-spike.ps1` | OCR approach: Phase 0 feasibility test — screenshots the grid, runs Windows OCR once, prints raw results |
-| `04-ocr-search.ps1` | OCR approach: full search tool with scrolling and highlight overlay |
+| `04-ocr-search.ps1` | OCR approach: full search tool with window picker, scrolling and highlight overlay |
+| `Test-Grid.ps1` | A fake 25-row grid for trying the tool without IMR. Launched from the **Test grid** button, no need to run it yourself |
+
+### Double-click launchers
+
+| Launcher | Runs |
+|---|---|
+| `IMR-Part-Search.bat` | **The OCR tool. This is the only file you need to open.** |
+| `Run-Probe.bat` | The MSAA probe (01) |
+| `Run-Search-MSAA.bat` | The MSAA search tool (02) |
+| `Run-OCR-Spike.bat` | The OCR feasibility spike (03) |
 
 ---
 
@@ -138,14 +148,23 @@ can see exactly what OCR saw.
 
 ### Running the search (04)
 
-1. Open `04-ocr-search.ps1` in Notepad.
-2. Adjust the CONFIG block if needed (`$WindowMatch`, `$Upscale`,
-   `$Contrast`).
-3. Paste into PowerShell with IMR open.
+**Double-click `IMR-Part-Search.bat`.** That is the whole thing — one
+file, nothing else to start.
 
-A small box appears. Type a part number, press Enter. The tool:
-- Screenshots the IMR window
-- Runs OCR
+The window has a **Page to search** dropdown at the top listing every
+open window. Pick the one holding the grid:
+
+- Leave it on **(auto)** and it finds any window whose title contains
+  `Incoming`, which is the normal IMR case.
+- Or pick IMR explicitly from the list if the title differs.
+- **Refresh** rescans the list after you open or close a window.
+- **Test grid** opens a fake 25-row grid so you can try the tool
+  without IMR, then selects it in the list for you.
+
+Then type a part number and press Enter. The tool:
+- Brings the selected window to the front
+- Hides its own search box (so OCR can't read the term back and
+  false-match on it), screenshots the window, and runs OCR
 - If the part isn't on screen, scrolls the grid and re-scans
 - Draws a yellow highlight overlay on the matching row
 
@@ -155,7 +174,7 @@ IMR underneath it.
 
 - **Fuzzy OCR** (`$FuzzyOCR = $true`) — treats common OCR confusable
   characters (0/O, 1/I/l, 5/S, 8/B) as equivalent when matching
-- **Shrink** — collapses the window
+- **Shrink** — collapses to just the picker and the search box
 - **Ctrl+Shift+F** — recalls the window from anywhere
 
 ---
