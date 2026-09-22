@@ -60,8 +60,8 @@ foreach ($p in $parts) {
 $form.Controls.Add($dgv)
 
 Write-Host ""
-Write-Host "Test grid is running. Use Run-Search-MSAA.bat or Run-Search-OCR.bat to search it." -ForegroundColor Green
-Write-Host "Window title contains 'Incoming' so the tools will find it." -ForegroundColor Green
+Write-Host "Test grid is running. Search it from IMR-Part-Search.bat." -ForegroundColor Green
+Write-Host "Window title contains 'Incoming' so the tool finds it automatically." -ForegroundColor Green
 Write-Host ""
 
 [System.Windows.Forms.Application]::Run($form)
