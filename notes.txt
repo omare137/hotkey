@@ -1,5 +1,7 @@
 sequence:
 
+--- APPROACH A: MSAA (try first) ---
+
 Open IMR with an order loaded. Turn the volume down. Ctrl+Windows+Enter to start Narrator, click into the part number table, press the down arrow a few times, Ctrl+Windows+Enter to stop.
 
 Open IMR, load an order.
@@ -15,3 +17,17 @@ Copilot reads the output with you and tells you the three config values, mainly 
 Open 02-part-search.ps1 in Notepad, put those three values in the CONFIG block, save.
 
 Paste 02-part-search.ps1 into PowerShell. Search box appears. Test it.
+
+--- APPROACH B: OCR (fallback if MSAA shows empty text) ---
+
+If 01-probe.ps1 reports NOT BUILDABLE, or rows show up but the text is blank:
+
+1. Open IMR with an order loaded.
+2. Paste 03-ocr-spike.ps1 into PowerShell.
+3. During the 4s countdown, click the IMR window.
+4. Check the output: are part numbers readable?
+   - Clean -> proceed to step 5.
+   - Mangled -> raise $Upscale to 3 or $Contrast to 1.4 and re-run.
+5. Paste 04-ocr-search.ps1 into PowerShell.
+6. Type a part number, press Enter. Yellow highlight appears on the row.
+7. Click the row in IMR underneath the highlight.
