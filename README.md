@@ -76,7 +76,6 @@ installs. Only `System.Drawing`, `System.Windows.Forms`, and
 | `Run-Probe.bat` | The MSAA probe (01) |
 | `Run-Search-MSAA.bat` | The MSAA search tool (02) |
 | `Run-OCR-Spike.bat` | The OCR feasibility spike (03) |
-| `Run-Test-Grid.bat` | The fake grid, for trying the tool without IMR |
 
 ---
 
@@ -159,14 +158,6 @@ open window. Pick the one holding the grid:
   `Incoming`, which is the normal IMR case.
 - Or pick IMR explicitly from the list if the title differs.
 - **Refresh** rescans the list after you open or close a window.
-
-The PowerShell console minimises itself once the search box is up. It
-is minimised rather than hidden on purpose — if the script ever dies,
-the window is still in the taskbar so you can restore it and read the
-error.
-
-To try the tool without IMR, double-click `Run-Test-Grid.bat` for a
-fake 25-row grid, then pick it in the dropdown.
 
 Then type a part number and press Enter. The tool:
 - Brings the selected window to the front and drops its own search box
