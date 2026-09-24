@@ -739,24 +739,10 @@ $btnSearch.Location = New-Object System.Drawing.Point(306, 45)
 $btnSearch.Size     = New-Object System.Drawing.Size(100, 33)
 $form.Controls.Add($btnSearch)
 
-$btnSlim          = New-Object System.Windows.Forms.Button
-$btnSlim.Text     = "Shrink"
-$btnSlim.Location = New-Object System.Drawing.Point(12, 86)
-$btnSlim.Size     = New-Object System.Drawing.Size(65, 26)
-$btnSlim.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
-$form.Controls.Add($btnSlim)
-
-$btnTestGrid          = New-Object System.Windows.Forms.Button
-$btnTestGrid.Text     = "Test grid"
-$btnTestGrid.Location = New-Object System.Drawing.Point(83, 86)
-$btnTestGrid.Size     = New-Object System.Drawing.Size(70, 26)
-$btnTestGrid.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
-$form.Controls.Add($btnTestGrid)
-
 $hint          = New-Object System.Windows.Forms.Label
 $hint.Text     = "Type a part number and press Enter"
-$hint.Location = New-Object System.Drawing.Point(160, 90)
-$hint.Size     = New-Object System.Drawing.Size(250, 20)
+$hint.Location = New-Object System.Drawing.Point(12, 90)
+$hint.Size     = New-Object System.Drawing.Size(300, 20)
 $hint.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
 $hint.ForeColor = [System.Drawing.Color]::Gray
 $form.Controls.Add($hint)
@@ -810,28 +796,6 @@ $btnRefresh.Add_Click({
     Say "Window list refreshed." ([System.Drawing.Color]::Black)
 })
 
-# ---- launch the bundled test grid ------------------------------------
-$btnTestGrid.Add_Click({
-    $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-    $gridPath = Join-Path $root 'Test-Grid.ps1'
-    if (-not (Test-Path $gridPath)) {
-        Say "Test-Grid.ps1 not found next to this script." ([System.Drawing.Color]::Firebrick)
-        return
-    }
-    Start-Process -FilePath 'powershell.exe' `
-        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $gridPath)
-    Start-Sleep -Milliseconds 1200
-    Refresh-WindowList
-
-    for ($i = 1; $i -lt $cmbWindow.Items.Count; $i++) {
-        if ($cmbWindow.Items[$i] -like '*Test Grid*') { $cmbWindow.SelectedIndex = $i; break }
-    }
-
-    Say "Test grid opened and selected. Try KELECRES-1006483A0." ([System.Drawing.Color]::ForestGreen)
-    $form.TopMost = $true
-    $txt.Focus()
-})
-
 # ---- auto-clear the visible leftovers ---------------------------------
 # A part number in the box and the row it matched in the result line are
 # both order data left sitting on screen. Blank them a short while after
@@ -858,20 +822,6 @@ $doFind = {
 
 $txt.Add_KeyDown({ if ($_.KeyCode -eq 'Enter') { $_.SuppressKeyPress = $true; & $doFind } })
 $btnSearch.Add_Click({ & $doFind })
-
-# ---- shrink / expand -------------------------------------------------
-$script:slim = $false
-$btnSlim.Add_Click({
-    if ($script:slim) {
-        $form.Size = New-Object System.Drawing.Size(430, 232)
-        $btnSlim.Text = "Shrink"
-        $script:slim = $false
-    } else {
-        $form.Size = New-Object System.Drawing.Size(430, 124)
-        $btnSlim.Text = "Expand"
-        $script:slim = $true
-    }
-})
 
 # ---- global recall hotkey: Ctrl + Shift + F --------------------------
 $script:hotHeld = $false

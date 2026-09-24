@@ -66,7 +66,7 @@ installs. Only `System.Drawing`, `System.Windows.Forms`, and
 | `02-part-search.ps1` | MSAA approach: always-on-top search box, finds and selects the matching row |
 | `03-ocr-spike.ps1` | OCR approach: Phase 0 feasibility test — screenshots the grid, runs Windows OCR once, prints raw results |
 | `04-ocr-search.ps1` | OCR approach: full search tool with window picker, scrolling, and click-the-row |
-| `Test-Grid.ps1` | A fake 25-row grid for trying the tool without IMR. Launched from the **Test grid** button, no need to run it yourself |
+| `Test-Grid.ps1` | A fake 25-row grid for trying the tool without IMR |
 
 ### Double-click launchers
 
@@ -158,8 +158,6 @@ open window. Pick the one holding the grid:
   `Incoming`, which is the normal IMR case.
 - Or pick IMR explicitly from the list if the title differs.
 - **Refresh** rescans the list after you open or close a window.
-- **Test grid** opens a fake 25-row grid so you can try the tool
-  without IMR, then selects it in the list for you.
 
 Then type a part number and press Enter. The tool:
 - Brings the selected window to the front and drops its own search box
@@ -199,7 +197,6 @@ end when a scroll stops changing what OCR reads.
 
 - **Fuzzy OCR** (`$FuzzyOCR = $true`) — treats common OCR confusable
   characters (0/O, 1/I/l, 5/S, 8/B) as equivalent when matching
-- **Shrink** — collapses to just the picker and the search box
 - **Ctrl+Shift+F** — recalls the window from anywhere
 
 ### About the click
