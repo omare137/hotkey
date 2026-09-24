@@ -193,6 +193,14 @@ function Clear-BitmapPixels([System.Drawing.Bitmap]$bmp) {
     catch { }
 }
 
+# Releasing Windows Runtime objects from Windows PowerShell 5.1 is not
+# dependable -- Dispose may not be exposed on the projected type. Cleanup
+# must never be able to fail a search, so any error here is swallowed.
+function Close-Quietly($obj) {
+    if ($null -eq $obj) { return }
+    try { $obj.Dispose() } catch { }
+}
+
 # Best effort: reaching a WinRT buffer needs COM interop that can fail
 # on some builds. A failure here leaves this one decoded copy to the
 # allocator; every other copy is still wiped.
@@ -247,8 +255,8 @@ function ConvertTo-SoftwareBitmap([System.Drawing.Bitmap]$bmp) {
     }
     finally {
         [Array]::Clear($bytes, 0, $bytes.Length)
-        $writer.Dispose()
-        $ras.Dispose()
+        Close-Quietly $writer
+        Close-Quietly $ras
     }
 }
 
@@ -317,15 +325,15 @@ function Capture-And-OCR([int]$left, [int]$top, [int]$w, [int]$h) {
         # these holds a full copy of the captured screen.
         if ($swBmp) {
             Clear-SoftwareBitmap $swBmp
-            $swBmp.Dispose()
+            Close-Quietly $swBmp
         }
         if ($proc -and -not [Object]::ReferenceEquals($proc, $shot)) {
             Clear-BitmapPixels $proc
-            $proc.Dispose()
+            Close-Quietly $proc
         }
         if ($shot) {
             Clear-BitmapPixels $shot
-            $shot.Dispose()
+            Close-Quietly $shot
         }
     }
 }
@@ -813,7 +821,14 @@ $doFind = {
     if (-not $term) { return }
     $clearTimer.Stop()
 
-    Do-Search $term $lbl $form
+    try {
+        Do-Search $term $lbl $form
+    }
+    catch {
+        # Put the real failure where the operator can see and report it,
+        # instead of losing it in the console behind the window.
+        Say "Error: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+    }
 
     if ($ClearAfterSec -gt 0) { $clearTimer.Start() }
     $txt.SelectAll()
