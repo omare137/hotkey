@@ -3,13 +3,17 @@
 # ============================================================
 #  A small always-on-top search box. The operator types a part
 #  number, and the tool screenshots the IMR grid, reads it with
-#  the BUILT-IN Windows OCR engine, finds the matching row, and
-#  draws a bright highlight overlay on that row so the operator
-#  knows exactly which line to click.
+#  the BUILT-IN Windows OCR engine, finds the matching row, then
+#  moves the mouse onto that row and clicks it, so IMR selects
+#  the row exactly as if the operator had clicked it themselves.
 #
-#  If the part is not on the current screen, the tool scrolls
-#  the grid one page at a time, re-screenshots, and re-OCRs,
-#  repeating until it finds the part or reaches the bottom.
+#  If the part is not on the current screen, the tool scrolls by
+#  spinning the real mouse wheel over the grid, re-screenshots and
+#  re-OCRs after each step, and sweeps DOWN to the bottom then
+#  back UP to the top. Those two passes cover the whole grid from
+#  wherever the operator happened to be sitting, which matters
+#  because there is no dependable way to jump to a known row.
+#  Press Esc to abort a long search.
 #
 #  STOCK WINDOWS ONLY. Nothing installed, nothing downloaded.
 #  Uses only System.Drawing, System.Windows.Forms, and the
@@ -20,8 +24,12 @@
 #    - does not install anything
 #    - does not modify IMR or its memory
 #    - does not write to any database
-#    - does not click anything in IMR (by default)
-#  It reads pixels, moves the mouse wheel, and draws an overlay.
+#  It reads pixels, moves the mouse, and issues ONE left click on
+#  the matched row. That click is the same input a human hand
+#  would produce. It never types, never presses a button, and
+#  refuses to click at all if the target falls outside the grid
+#  window. Set $AutoClick = $false to only park the pointer on
+#  the row and leave the clicking to the operator.
 #
 #  HOW TO RUN: double-click IMR-Part-Search.bat. That is the
 #  only file you need to open. Pick the window to search from
@@ -38,13 +46,26 @@ $Upscale      = 2.0
 # Boost contrast to help separate text from grid lines. 1 = off.
 $Contrast     = 1.0
 # Milliseconds to wait after scrolling before re-capturing.
-$ScrollDelay  = 200
-# Maximum pages to scroll before giving up.
+$ScrollDelay  = 220
+# Wheel notches per scroll step. Most grids move 3 rows per notch, so 5
+# advances about 15 rows. Lower this if rows are being skipped between
+# scans; raise it to search long orders faster.
+$WheelNotches = 5
+# Maximum scroll steps before giving up.
 $MaxPages     = 200
-# Seconds the highlight overlay stays visible.
-$HighlightSec = 8
 # Fuzzy match: treat common OCR confusable characters as equivalent.
 $FuzzyOCR     = $true
+# Click the matched row automatically. Set to $false to only move the
+# mouse pointer there and let the operator click, which is the safer
+# setting while you are still confirming the tool aims correctly.
+$AutoClick    = $true
+# How far right of the row's leftmost text to click, in pixels. This
+# should land inside the Part Number cell, not on the row edge.
+$ClickInsetX  = 25
+# Seconds before the search box and the result line are blanked, so a
+# part number and the row it matched are not left sitting on screen
+# after the operator walks away. 0 disables the auto-clear.
+$ClearAfterSec = 30
 # ================================================
 
 Add-Type -AssemblyName System.Drawing
@@ -61,8 +82,6 @@ public class Win {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
-    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr p);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
@@ -72,11 +91,24 @@ public class Win {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
-    [DllImport("user32.dll", CharSet = CharSet.Auto)]
-    public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr wp, IntPtr lp);
-    [DllImport("user32.dll")]
-    public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+    // dwData is declared int, not uint, so a negative wheel delta
+    // (scroll down) can be passed straight through.
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, int data, IntPtr extra);
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
 
+    // The top-level window that owns whatever is drawn at this screen
+    // point, or zero if nothing is there.
+    public static IntPtr RootAt(int x, int y) {
+        POINT p; p.X = x; p.Y = y;
+        IntPtr h = WindowFromPoint(p);
+        if (h == IntPtr.Zero) return IntPtr.Zero;
+        return GetAncestor(h, 2); // GA_ROOT
+    }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
 
     public static List<IntPtr> Tops() {
@@ -92,8 +124,40 @@ public class Win {
     public static string Title(IntPtr h) {
         StringBuilder sb = new StringBuilder(512); GetWindowText(h, sb, 512); return sb.ToString();
     }
+
+    // Overwrite a block of unmanaged memory with zeros. Disposing a
+    // bitmap only hands its memory back to the allocator; the pixels
+    // stay readable in that freed block until something happens to
+    // reuse it. Zeroing first means there is nothing left to recover.
+    public static void ZeroMemory(IntPtr dest, long len) {
+        if (dest == IntPtr.Zero || len <= 0) return;
+        byte[] zeros = new byte[65536];
+        long off = 0;
+        while (off < len) {
+            int n = (int)Math.Min((long)zeros.Length, len - off);
+            Marshal.Copy(zeros, 0, new IntPtr(dest.ToInt64() + off), n);
+            off += n;
+        }
+    }
+}
+
+// Lets us reach the raw bytes behind a WinRT memory buffer, which is
+// the only way to zero the decoded copy of the screen that the OCR
+// engine actually reads.
+[ComImport]
+[Guid("5B0D3235-4DBA-4D44-865E-8F1D0E4FD04D")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IMemoryBufferByteAccess {
+    void GetBuffer(out IntPtr buffer, out uint capacity);
 }
 "@
+
+# Opt into real screen pixels before any window exists. Without this,
+# Windows virtualises coordinates for this process on a scaled display
+# (125%, 150%), so the pixel the screenshot was taken from and the pixel
+# the mouse is sent to are different points and the click lands on the
+# wrong row. Everything downstream now shares one coordinate space.
+try { [Win]::SetProcessDPIAware() | Out-Null } catch { }
 
 # ---- WinRT / Windows.Media.Ocr plumbing ------------------------------
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -113,22 +177,80 @@ $null = [Windows.Graphics.Imaging.SoftwareBitmap,   Windows.Graphics.Imaging,   
 $null = [Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
 $null = [Windows.Storage.Streams.DataWriter,        Windows.Storage.Streams,     ContentType = WindowsRuntime]
 
+# ---- wiping captured pixels ------------------------------------------
+# Disposing a buffer returns it to the allocator without erasing it, so
+# every copy of the screen is overwritten with zeros before release.
+
+function Clear-BitmapPixels([System.Drawing.Bitmap]$bmp) {
+    if (-not $bmp) { return }
+    try {
+        $rect = New-Object System.Drawing.Rectangle(0, 0, $bmp.Width, $bmp.Height)
+        $data = $bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::WriteOnly, $bmp.PixelFormat)
+        try {
+            [Win]::ZeroMemory($data.Scan0, ([long][Math]::Abs($data.Stride) * $data.Height))
+        }
+        finally { $bmp.UnlockBits($data) }
+    }
+    catch { }
+}
+
+# Best effort: reaching a WinRT buffer needs COM interop that can fail
+# on some builds. A failure here leaves this one decoded copy to the
+# allocator; every other copy is still wiped.
+function Clear-SoftwareBitmap($swBmp) {
+    if (-not $swBmp) { return }
+    try {
+        $buf = $swBmp.LockBuffer([Windows.Graphics.Imaging.BitmapBufferAccessMode]::Write)
+        try {
+            $ref = $buf.CreateReference()
+            try {
+                $access = [IMemoryBufferByteAccess]$ref
+                $ptr = [IntPtr]::Zero
+                $cap = [uint32]0
+                $access.GetBuffer([ref]$ptr, [ref]$cap)
+                [Win]::ZeroMemory($ptr, [long]$cap)
+            }
+            finally { $ref.Dispose() }
+        }
+        finally { $buf.Dispose() }
+    }
+    catch { }
+}
+
+# Everything here is in-memory: a MemoryStream and an
+# InMemoryRandomAccessStream. The captured pixels never touch disk.
 function ConvertTo-SoftwareBitmap([System.Drawing.Bitmap]$bmp) {
+    $bytes = $null
     $ms = New-Object System.IO.MemoryStream
-    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Bmp)
-    $bytes = $ms.ToArray()
-    $ms.Dispose()
+    try {
+        $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Bmp)
+        $bytes = $ms.ToArray()
+        # ToArray copied it out, so the stream still holds an encoded
+        # image of the screen in its own array. Blank that too.
+        $inner = $ms.GetBuffer()
+        [Array]::Clear($inner, 0, $inner.Length)
+    }
+    catch { }
+    finally { $ms.Dispose() }
+
+    if (-not $bytes) { return $null }
 
     $ras    = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
     $writer = New-Object Windows.Storage.Streams.DataWriter($ras)
-    $writer.WriteBytes($bytes)
-    Await $writer.StoreAsync() ([uint32]) | Out-Null
-    $writer.DetachStream() | Out-Null
-    $ras.Seek(0)
+    try {
+        $writer.WriteBytes($bytes)
+        Await $writer.StoreAsync() ([uint32]) | Out-Null
+        $writer.DetachStream() | Out-Null
+        $ras.Seek(0)
 
-    $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) ([Windows.Graphics.Imaging.BitmapDecoder])
-    $swBmp   = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-    return $swBmp
+        $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) ([Windows.Graphics.Imaging.BitmapDecoder])
+        return (Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap]))
+    }
+    finally {
+        [Array]::Clear($bytes, 0, $bytes.Length)
+        $writer.Dispose()
+        $ras.Dispose()
+    }
 }
 
 # ---- OCR engine singleton --------------------------------------------
@@ -148,61 +270,65 @@ function Normalize-ForOCR([string]$s) {
 
 # ---- capture and OCR a window region ---------------------------------
 function Capture-And-OCR([int]$left, [int]$top, [int]$w, [int]$h) {
-    # Our own always-on-top search box holds the very term we are looking
-    # for, so leaving it visible would let OCR read it back and report a
-    # false match. Go transparent for the duration of the grab.
-    $hidden = $false
-    if ($script:uiForm -and -not $script:uiForm.IsDisposed -and $script:uiForm.Opacity -gt 0) {
-        $script:uiForm.Opacity = 0
-        [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 60
-        $hidden = $true
-    }
+    # Do-Search drops our own window behind the grid before calling this,
+    # so the search box (which holds the very term being looked for, and
+    # would otherwise be read back as a false match) is not in the pixels.
+    # Every bitmap is released in the finally below, on all paths. The
+    # captured pixels exist only for the duration of one recognise call.
+    $shot = $null; $proc = $null; $swBmp = $null
+    try {
+        $shot = New-Object System.Drawing.Bitmap($w, $h)
+        $g = [System.Drawing.Graphics]::FromImage($shot)
+        try { $g.CopyFromScreen($left, $top, 0, 0, $shot.Size) }
+        finally { $g.Dispose() }
 
-    $shot = New-Object System.Drawing.Bitmap($w, $h)
-    $g = [System.Drawing.Graphics]::FromImage($shot)
-    $g.CopyFromScreen($left, $top, 0, 0, $shot.Size)
-    $g.Dispose()
-
-    if ($hidden) {
-        $script:uiForm.Opacity = 1
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-
-    $proc = $shot
-    if ($Upscale -ne 1.0 -or $Contrast -ne 1.0) {
-        $nw = [int]($w * $Upscale)
-        $nh = [int]($h * $Upscale)
-        $big = New-Object System.Drawing.Bitmap($nw, $nh)
-        $bg  = [System.Drawing.Graphics]::FromImage($big)
-        $bg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-
-        if ($Contrast -ne 1.0) {
-            $c = [float]$Contrast
-            $t = [float]((1 - $c) / 2)
-            $cm = New-Object System.Drawing.Imaging.ColorMatrix
-            $cm.Matrix00 = $c; $cm.Matrix11 = $c; $cm.Matrix22 = $c
-            $cm.Matrix40 = $t; $cm.Matrix41 = $t; $cm.Matrix42 = $t
-            $ia = New-Object System.Drawing.Imaging.ImageAttributes
-            $ia.SetColorMatrix($cm)
-            $bg.DrawImage($shot, (New-Object System.Drawing.Rectangle(0,0,$nw,$nh)), 0,0,$w,$h, [System.Drawing.GraphicsUnit]::Pixel, $ia)
-        } else {
-            $bg.DrawImage($shot, 0, 0, $nw, $nh)
+        $proc = $shot
+        if ($Upscale -ne 1.0 -or $Contrast -ne 1.0) {
+            $nw = [int]($w * $Upscale)
+            $nh = [int]($h * $Upscale)
+            $big = New-Object System.Drawing.Bitmap($nw, $nh)
+            $bg  = [System.Drawing.Graphics]::FromImage($big)
+            try {
+                $bg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                if ($Contrast -ne 1.0) {
+                    $c = [float]$Contrast
+                    $t = [float]((1 - $c) / 2)
+                    $cm = New-Object System.Drawing.Imaging.ColorMatrix
+                    $cm.Matrix00 = $c; $cm.Matrix11 = $c; $cm.Matrix22 = $c
+                    $cm.Matrix40 = $t; $cm.Matrix41 = $t; $cm.Matrix42 = $t
+                    $ia = New-Object System.Drawing.Imaging.ImageAttributes
+                    $ia.SetColorMatrix($cm)
+                    $bg.DrawImage($shot, (New-Object System.Drawing.Rectangle(0,0,$nw,$nh)), 0,0,$w,$h, [System.Drawing.GraphicsUnit]::Pixel, $ia)
+                } else {
+                    $bg.DrawImage($shot, 0, 0, $nw, $nh)
+                }
+            }
+            finally { $bg.Dispose() }
+            $proc = $big
         }
-        $bg.Dispose()
-        $proc = $big
+
+        $eng = Get-OcrEngine
+        if (-not $eng) { return $null }
+
+        $swBmp = ConvertTo-SoftwareBitmap $proc
+        return (Await ($eng.RecognizeAsync($swBmp)) ([Windows.Media.Ocr.OcrResult]))
     }
-
-    $eng = Get-OcrEngine
-    if (-not $eng) { return $null }
-
-    $swBmp  = ConvertTo-SoftwareBitmap $proc
-    $result = Await ($eng.RecognizeAsync($swBmp)) ([Windows.Media.Ocr.OcrResult])
-
-    $shot.Dispose()
-    if ($proc -ne $shot) { $proc.Dispose() }
-
-    return $result
+    finally {
+        # Wipe before release, in reverse order of creation. Each of
+        # these holds a full copy of the captured screen.
+        if ($swBmp) {
+            Clear-SoftwareBitmap $swBmp
+            $swBmp.Dispose()
+        }
+        if ($proc -and -not [Object]::ReferenceEquals($proc, $shot)) {
+            Clear-BitmapPixels $proc
+            $proc.Dispose()
+        }
+        if ($shot) {
+            Clear-BitmapPixels $shot
+            $shot.Dispose()
+        }
+    }
 }
 
 # ---- window picking --------------------------------------------------
@@ -321,68 +447,127 @@ function Search-Screen($ocrResult, [string]$term, [float]$scale) {
     return $null
 }
 
-# ---- highlight overlay -----------------------------------------------
-# A borderless, always-on-top, click-through transparent form that
-# draws a bright box over the found row. Dismisses on timer or keypress.
-function Show-Highlight([int]$screenX, [int]$screenY, [int]$w, [int]$h, [int]$durationMs) {
-    $pad = 4
-    $ov = New-Object System.Windows.Forms.Form
-    $ov.FormBorderStyle = 'None'
-    $ov.TopMost         = $true
-    $ov.ShowInTaskbar   = $false
-    $ov.StartPosition   = 'Manual'
-    $ov.Location        = New-Object System.Drawing.Point(([Math]::Max(0, $screenX - $pad)), ([Math]::Max(0, $screenY - $pad)))
-    $ov.Size            = New-Object System.Drawing.Size(($w + 2*$pad), ($h + 2*$pad))
-    $ov.BackColor       = [System.Drawing.Color]::Yellow
-    $ov.Opacity         = 0.35
-    $ov.Cursor          = [System.Windows.Forms.Cursors]::Hand
+# ---- go to the matched row -------------------------------------------
+# Moves the pointer onto the row and clicks it, so IMR selects the row
+# exactly as if the operator had clicked it themselves.
+#
+# A stray click in IMR could hit Print Labels or Clear, so the target is
+# rejected unless it lies inside the captured window AND that window is
+# what is actually drawn there AND the pointer reached it. Failing any
+# of those we do nothing and say so, rather than click blind.
+function Invoke-RowClick([IntPtr]$hwnd, [int]$screenX, [int]$screenY, [System.Windows.Forms.Label]$statusLbl) {
+    $r = New-Object Win+RECT
+    [Win]::GetWindowRect($hwnd, [ref]$r) | Out-Null
 
-    $timer          = New-Object System.Windows.Forms.Timer
-    $timer.Interval = $durationMs
-    $timer.Add_Tick({ $ov.Close() })
-    $timer.Start()
+    if ($screenX -lt $r.Left -or $screenX -gt $r.Right -or
+        $screenY -lt $r.Top  -or $screenY -gt $r.Bottom) {
+        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+        $statusLbl.Text = "Row found but its position looks wrong. Not clicking."
+        return $false
+    }
 
-    $ov.Add_Click({ $ov.Close() })
-    $ov.Add_KeyPress({ $ov.Close() })
-    $ov.Add_FormClosing({ $timer.Stop(); $timer.Dispose() })
+    # The grid must be what is actually drawn at that point, so a window
+    # sitting over it cannot swallow the click.
+    if ([Win]::RootAt($screenX, $screenY) -ne $hwnd) {
+        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+        $statusLbl.Text = "Something is covering that row. Not clicking."
+        return $false
+    }
 
-    $ov.Show()
-    return $ov
+    [Win]::SetCursorPos($screenX, $screenY) | Out-Null
+    Start-Sleep -Milliseconds 90
+
+    if (-not $AutoClick) { return $true }
+
+    # Confirm the pointer landed where we asked before clicking.
+    $now = New-Object Win+POINT
+    [Win]::GetCursorPos([ref]$now) | Out-Null
+    if ([Math]::Abs($now.X - $screenX) -gt 3 -or [Math]::Abs($now.Y - $screenY) -gt 3) {
+        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+        $statusLbl.Text = "Could not position the pointer. Not clicking."
+        return $false
+    }
+
+    $MOUSEEVENTF_LEFTDOWN = 0x0002
+    $MOUSEEVENTF_LEFTUP   = 0x0004
+    [Win]::mouse_event($MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 40
+    [Win]::mouse_event($MOUSEEVENTF_LEFTUP, 0, 0, 0, [IntPtr]::Zero)
+    return $true
 }
 
 # ---- scroll the grid -------------------------------------------------
-function Scroll-GridDown([IntPtr]$hwnd) {
-    $WM_MOUSEWHEEL = 0x020A
-    $WHEEL_DELTA   = -120 * 3
-    $packed = [IntPtr]([int64]($WHEEL_DELTA -shl 16))
-
-    $clientRect = New-Object Win+RECT
-    [Win]::GetClientRect($hwnd, [ref]$clientRect) | Out-Null
-    $pt = New-Object Win+POINT
-    $pt.X = [int](($clientRect.Right - $clientRect.Left) / 2)
-    $pt.Y = [int](($clientRect.Bottom - $clientRect.Top) / 2)
-    [Win]::ClientToScreen($hwnd, [ref]$pt) | Out-Null
-    $lparam = [IntPtr]([int64](($pt.Y -shl 16) -bor ($pt.X -band 0xFFFF)))
-
-    [Win]::PostMessage($hwnd, $WM_MOUSEWHEEL, $packed, $lparam) | Out-Null
+# The rows live in a child control inside the window, so posting
+# WM_MOUSEWHEEL or WM_VSCROLL to the top-level handle scrolls nothing --
+# the messages never reach the control that owns the scrollbar, and we
+# have no reliable way to identify that control in an owner-drawn grid.
+#
+# Instead we park the real mouse pointer over the grid and emit a real
+# wheel event. Windows then routes it to whatever is under the pointer,
+# exactly as if the operator had spun the wheel, so it works regardless
+# of how the grid is built.
+function Get-GridPoint([IntPtr]$hwnd) {
+    $r = New-Object Win+RECT
+    [Win]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+    # 60% down the window, to stay clear of the toolbar and headers.
+    $x = $r.Left + [int](($r.Right  - $r.Left) * 0.5)
+    $y = $r.Top  + [int](($r.Bottom - $r.Top)  * 0.6)
+    return ,@($x, $y)
 }
 
-function Scroll-GridToTop([IntPtr]$hwnd) {
-    $WM_VSCROLL = 0x0115
-    $SB_TOP     = [IntPtr]6
-    [Win]::SendMessage($hwnd, $WM_VSCROLL, $SB_TOP, [IntPtr]::Zero) | Out-Null
+# $notches is positive to scroll up, negative to scroll down.
+function Send-Wheel([IntPtr]$hwnd, [int]$notches) {
+    $MOUSEEVENTF_WHEEL = 0x0800
+    $p = Get-GridPoint $hwnd
+
+    # If the grid is not what sits under that point, a wheel event there
+    # would scroll some other window instead. Say nothing and do nothing.
+    if ([Win]::RootAt($p[0], $p[1]) -ne $hwnd) { return $false }
+
+    [Win]::SetCursorPos($p[0], $p[1]) | Out-Null
+    Start-Sleep -Milliseconds 20
+    [Win]::mouse_event($MOUSEEVENTF_WHEEL, 0, 0, ($notches * 120), [IntPtr]::Zero)
+    return $true
 }
 
 # ---- the main search pipeline ----------------------------------------
-$script:targetHwnd  = [IntPtr]::Zero
-$script:overlayForm = $null
-$script:lastHash    = ''
+# Detecting "the grid stopped moving" only needs to know whether a page
+# reads the same as the last one, never what it said. Keeping a hash
+# instead of the text means no page of order data is held across the
+# loop -- only 32 bytes that cannot be read back.
+function Get-PageFingerprint([string]$s) {
+    if (-not $s) { return '' }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $b = [System.Text.Encoding]::UTF8.GetBytes($s)
+        try { return [Convert]::ToBase64String($sha.ComputeHash($b)) }
+        finally { [Array]::Clear($b, 0, $b.Length) }
+    }
+    finally { $sha.Dispose() }
+}
+
+# Capture the target window and look for the term. Returns the hit, or
+# $null, plus a fingerprint of the page so the caller can tell when
+# scrolling has stopped moving.
+function Scan-Once([IntPtr]$hwnd, [string]$term, [float]$scale) {
+    $r = New-Object Win+RECT
+    [Win]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+    $w = $r.Right - $r.Left
+    $h = $r.Bottom - $r.Top
+    if ($w -le 0 -or $h -le 0) { return $null }
+
+    $ocr = Capture-And-OCR $r.Left $r.Top $w $h
+    if (-not $ocr) { return $null }
+
+    return [pscustomobject]@{
+        Hit         = (Search-Screen $ocr $term $scale)
+        Fingerprint = (Get-PageFingerprint $ocr.Text)
+        WinLeft     = $r.Left
+        WinTop      = $r.Top
+    }
+}
 
 function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [System.Windows.Forms.Form]$parentForm) {
-    if ($script:overlayForm -and -not $script:overlayForm.IsDisposed) {
-        $script:overlayForm.Close()
-    }
-
     if (-not $term) { return }
 
     $hwnd = Find-TargetWindow
@@ -391,112 +576,117 @@ function Do-Search([string]$term, [System.Windows.Forms.Label]$statusLbl, [Syste
         $statusLbl.Text = "No target window. Pick one from the dropdown."
         return
     }
-    $script:targetHwnd = $hwnd
 
-    # Bring the target forward so nothing is covering the grid we OCR.
-    $SW_RESTORE = 9
-    if ([Win]::IsIconic($hwnd)) {
-        [Win]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
-        Start-Sleep -Milliseconds 250
-    }
-    [Win]::SetForegroundWindow($hwnd) | Out-Null
-    Start-Sleep -Milliseconds 120
+    # Step out of always-on-top and put the grid in front for the whole
+    # search. This is what makes the rest work: our own box is no longer
+    # in the captured pixels, no longer under the pointer when the wheel
+    # is spun, and no longer able to swallow the click.
+    $wasTop = $parentForm.TopMost
+    $parentForm.TopMost = $false
 
-    $rect = New-Object Win+RECT
-    [Win]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
-    $ww = $rect.Right - $rect.Left
-    $wh = $rect.Bottom - $rect.Top
-    if ($ww -le 0 -or $wh -le 0) {
-        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
-        $statusLbl.Text = "IMR window has no usable size."
-        return
-    }
+    try {
+        $SW_RESTORE = 9
+        if ([Win]::IsIconic($hwnd)) {
+            [Win]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
+            Start-Sleep -Milliseconds 250
+        }
+        [Win]::SetForegroundWindow($hwnd) | Out-Null
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 150
 
-    $winLeft = $rect.Left
-    $winTop  = $rect.Top
+        $scale = if ($Upscale -ne 1.0) { $Upscale } else { 1.0 }
 
-    $statusLbl.ForeColor = [System.Drawing.Color]::Black
-    $statusLbl.Text = "Scanning current view..."
-    $parentForm.Refresh()
-
-    $scale = if ($Upscale -ne 1.0) { $Upscale } else { 1.0 }
-    $ocrResult = Capture-And-OCR $winLeft $winTop $ww $wh
-    if (-not $ocrResult) {
-        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
-        $statusLbl.Text = "Windows OCR is not available on this PC."
-        return
-    }
-
-    $hit = Search-Screen $ocrResult $term $scale
-    if ($hit) {
-        $sx = $winLeft + $hit.XLeft
-        $sy = $winTop  + $hit.YTop
-        $sw = $hit.XRight - $hit.XLeft
-        $sh = $hit.YBot   - $hit.YTop
-
-        $script:overlayForm = Show-Highlight $sx $sy $sw $sh ($HighlightSec * 1000)
-
-        $statusLbl.ForeColor = [System.Drawing.Color]::ForestGreen
-        $statusLbl.Text = "Found: $($hit.FullText)"
-        $parentForm.TopMost = $true
-        return
-    }
-
-    # not on this screen, start scrolling
-    $statusLbl.ForeColor = [System.Drawing.Color]::Black
-    $statusLbl.Text = "Not on screen. Scrolling to top..."
-    $parentForm.Refresh()
-
-    [Win]::SetForegroundWindow($hwnd) | Out-Null
-    Start-Sleep -Milliseconds 80
-    Scroll-GridToTop $hwnd
-    Start-Sleep -Milliseconds $ScrollDelay
-
-    $prevText = ''
-    for ($page = 0; $page -lt $MaxPages; $page++) {
-        [Win]::GetWindowRect($hwnd, [ref]$rect) | Out-Null
-        $winLeft = $rect.Left
-        $winTop  = $rect.Top
-        $ww = $rect.Right - $rect.Left
-        $wh = $rect.Bottom - $rect.Top
-
-        $statusLbl.Text = "Scanning page $($page + 1)..."
-        $parentForm.Refresh()
-
-        $ocrResult = Capture-And-OCR $winLeft $winTop $ww $wh
-        if (-not $ocrResult) { break }
-
-        $currentText = $ocrResult.Text
-        if ($currentText -eq $prevText -and $page -gt 0) {
+        $scan = Scan-Once $hwnd $term $scale
+        if (-not $scan) {
             $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
-            $statusLbl.Text = "Not found after scrolling the whole grid ($($page + 1) pages)."
-            $parentForm.TopMost = $true
+            $statusLbl.Text = "Could not read the window. Is Windows OCR available?"
             return
         }
-        $prevText = $currentText
-
-        $hit = Search-Screen $ocrResult $term $scale
-        if ($hit) {
-            $sx = $winLeft + $hit.XLeft
-            $sy = $winTop  + $hit.YTop
-            $sw = $hit.XRight - $hit.XLeft
-            $sh = $hit.YBot   - $hit.YTop
-
-            $script:overlayForm = Show-Highlight $sx $sy $sw $sh ($HighlightSec * 1000)
-
-            $statusLbl.ForeColor = [System.Drawing.Color]::ForestGreen
-            $statusLbl.Text = "Found on page $($page + 1): $($hit.FullText)"
-            $parentForm.TopMost = $true
+        if ($scan.Hit) {
+            Report-Hit $hwnd $scan 0 $statusLbl
             return
         }
 
-        Scroll-GridDown $hwnd
-        Start-Sleep -Milliseconds $ScrollDelay
+        # The row is off-screen. Sweep down to the bottom, then back up
+        # past the starting point to the top. Between them those two
+        # passes cover the whole grid without ever needing to jump to a
+        # known position, which no message we can send would do reliably.
+        $prevSeen = $scan.Fingerprint
+        $total    = 0
+
+        foreach ($dir in @(-1, 1)) {
+            $label = if ($dir -lt 0) { "down" } else { "up" }
+
+            # $MaxPages bounds each pass separately. A long sweep down
+            # must not leave the sweep back up unable to reach the top.
+            for ($step = 0; $step -lt $MaxPages; $step++) {
+                # A long sweep holds the mouse and blocks this thread for
+                # minutes, so leave the operator a way out.
+                if (([Win]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0) {
+                    $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+                    $statusLbl.Text = "Search cancelled."
+                    return
+                }
+
+                $statusLbl.ForeColor = [System.Drawing.Color]::Black
+                $statusLbl.Text = "Searching $label... ($total)"
+
+                if (-not (Send-Wheel $hwnd ($dir * $WheelNotches))) {
+                    $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+                    $statusLbl.Text = "Something is covering the grid. Cannot scroll."
+                    return
+                }
+                Start-Sleep -Milliseconds $ScrollDelay
+                $total++
+
+                $scan = Scan-Once $hwnd $term $scale
+                if (-not $scan) {
+                    $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+                    $statusLbl.Text = "Lost the window while scrolling."
+                    return
+                }
+
+                if ($scan.Hit) {
+                    Report-Hit $hwnd $scan $total $statusLbl
+                    return
+                }
+
+                # Nothing moved, so this end of the grid is reached.
+                if ($scan.Fingerprint -eq $prevSeen) { break }
+                $prevSeen = $scan.Fingerprint
+            }
+
+            # Force the up pass to run even though the down pass just
+            # ended on a page that stopped changing.
+            $prevSeen = ''
+        }
+
+        $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
+        $statusLbl.Text = "'$term' not found anywhere in the grid."
     }
+    finally {
+        if ($wasTop) { $parentForm.TopMost = $true }
 
-    $statusLbl.ForeColor = [System.Drawing.Color]::Firebrick
-    $statusLbl.Text = "Not found after $MaxPages pages."
-    $parentForm.TopMost = $true
+        # The wipes above have already zeroed each buffer, so this is
+        # about reclaiming them now rather than whenever the GC feels
+        # like it -- no freed block keeps its shape until then.
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+        [System.GC]::Collect()
+    }
+}
+
+function Report-Hit([IntPtr]$hwnd, $scan, [int]$pages, [System.Windows.Forms.Label]$statusLbl) {
+    $hit = $scan.Hit
+    $cx  = $scan.WinLeft + $hit.XLeft + $ClickInsetX
+    $cy  = $scan.WinTop  + [int](($hit.YTop + $hit.YBot) / 2)
+
+    if (Invoke-RowClick $hwnd $cx $cy $statusLbl) {
+        $statusLbl.ForeColor = [System.Drawing.Color]::ForestGreen
+        $verb  = if ($AutoClick) { "Clicked" } else { "Pointer on" }
+        $where = if ($pages -gt 0) { " (after $pages scrolls)" } else { "" }
+        $statusLbl.Text = "$verb$where`: $($hit.FullText)"
+    }
 }
 
 # ---- UI --------------------------------------------------------------
@@ -504,7 +694,7 @@ $script:selfTitle = "Find Part  (OCR)   Ctrl+Shift+F to recall"
 
 $form                 = New-Object System.Windows.Forms.Form
 $form.Text            = $script:selfTitle
-$form.Size            = New-Object System.Drawing.Size(430, 232)
+$form.Size            = New-Object System.Drawing.Size(430, 212)
 $form.TopMost         = $true
 $form.FormBorderStyle = 'FixedSingle'
 $form.MinimizeBox     = $true
@@ -513,7 +703,6 @@ $form.ShowInTaskbar   = $true
 $form.StartPosition   = 'Manual'
 $form.Location        = New-Object System.Drawing.Point(30, 30)
 $form.BackColor       = [System.Drawing.Color]::White
-$script:uiForm        = $form
 
 # --- target window picker ---
 $lblPage          = New-Object System.Windows.Forms.Label
@@ -551,31 +740,17 @@ $btnSearch.Location = New-Object System.Drawing.Point(306, 45)
 $btnSearch.Size     = New-Object System.Drawing.Size(100, 33)
 $form.Controls.Add($btnSearch)
 
-$btnSlim          = New-Object System.Windows.Forms.Button
-$btnSlim.Text     = "Shrink"
-$btnSlim.Location = New-Object System.Drawing.Point(12, 86)
-$btnSlim.Size     = New-Object System.Drawing.Size(65, 26)
-$btnSlim.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
-$form.Controls.Add($btnSlim)
-
-$btnTestGrid          = New-Object System.Windows.Forms.Button
-$btnTestGrid.Text     = "Test grid"
-$btnTestGrid.Location = New-Object System.Drawing.Point(83, 86)
-$btnTestGrid.Size     = New-Object System.Drawing.Size(70, 26)
-$btnTestGrid.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
-$form.Controls.Add($btnTestGrid)
-
 $hint          = New-Object System.Windows.Forms.Label
 $hint.Text     = "Type a part number and press Enter"
-$hint.Location = New-Object System.Drawing.Point(160, 90)
-$hint.Size     = New-Object System.Drawing.Size(250, 20)
+$hint.Location = New-Object System.Drawing.Point(12, 86)
+$hint.Size     = New-Object System.Drawing.Size(300, 20)
 $hint.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
 $hint.ForeColor = [System.Drawing.Color]::Gray
 $form.Controls.Add($hint)
 
 $lbl          = New-Object System.Windows.Forms.Label
-$lbl.Location = New-Object System.Drawing.Point(12, 120)
-$lbl.Size     = New-Object System.Drawing.Size(400, 62)
+$lbl.Location = New-Object System.Drawing.Point(12, 110)
+$lbl.Size     = New-Object System.Drawing.Size(400, 56)
 $lbl.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 $form.Controls.Add($lbl)
 
@@ -622,52 +797,32 @@ $btnRefresh.Add_Click({
     Say "Window list refreshed." ([System.Drawing.Color]::Black)
 })
 
-# ---- launch the bundled test grid ------------------------------------
-$btnTestGrid.Add_Click({
-    $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-    $gridPath = Join-Path $root 'Test-Grid.ps1'
-    if (-not (Test-Path $gridPath)) {
-        Say "Test-Grid.ps1 not found next to this script." ([System.Drawing.Color]::Firebrick)
-        return
-    }
-    Start-Process -FilePath 'powershell.exe' `
-        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $gridPath)
-    Start-Sleep -Milliseconds 1200
-    Refresh-WindowList
-
-    for ($i = 1; $i -lt $cmbWindow.Items.Count; $i++) {
-        if ($cmbWindow.Items[$i] -like '*Test Grid*') { $cmbWindow.SelectedIndex = $i; break }
-    }
-
-    Say "Test grid opened and selected. Try KELECRES-1006483A0." ([System.Drawing.Color]::ForestGreen)
-    $form.TopMost = $true
-    $txt.Focus()
+# ---- auto-clear the visible leftovers ---------------------------------
+# A part number in the box and the row it matched in the result line are
+# both order data left sitting on screen. Blank them a short while after
+# the search so nothing lingers once the operator moves on.
+$clearTimer          = New-Object System.Windows.Forms.Timer
+$clearTimer.Interval = [Math]::Max(1, $ClearAfterSec) * 1000
+$clearTimer.Add_Tick({
+    $clearTimer.Stop()
+    $txt.Clear()
+    $lbl.Text = ''
 })
 
 $doFind = {
     $term = $txt.Text.Trim()
     if (-not $term) { return }
+    $clearTimer.Stop()
+
     Do-Search $term $lbl $form
+
+    if ($ClearAfterSec -gt 0) { $clearTimer.Start() }
     $txt.SelectAll()
     $txt.Focus()
 }
 
 $txt.Add_KeyDown({ if ($_.KeyCode -eq 'Enter') { $_.SuppressKeyPress = $true; & $doFind } })
 $btnSearch.Add_Click({ & $doFind })
-
-# ---- shrink / expand -------------------------------------------------
-$script:slim = $false
-$btnSlim.Add_Click({
-    if ($script:slim) {
-        $form.Size = New-Object System.Drawing.Size(430, 232)
-        $btnSlim.Text = "Shrink"
-        $script:slim = $false
-    } else {
-        $form.Size = New-Object System.Drawing.Size(430, 124)
-        $btnSlim.Text = "Expand"
-        $script:slim = $true
-    }
-})
 
 # ---- global recall hotkey: Ctrl + Shift + F --------------------------
 $script:hotHeld = $false
@@ -694,14 +849,23 @@ $hotTimer.Start()
 
 $form.Add_FormClosing({
     $hotTimer.Stop()
-    if ($script:overlayForm -and -not $script:overlayForm.IsDisposed) {
-        $script:overlayForm.Close()
-    }
+    $clearTimer.Stop()
+    $txt.Clear()
+    $lbl.Text = ''
 })
 
 $form.Add_Shown({
+    # Get the PowerShell console out of the way now that the search box
+    # is up. Minimised rather than hidden on purpose: if the script dies
+    # later, the window is still in the taskbar to be restored and read.
+    $SW_MINIMIZE = 6
+    $con = [Win]::GetConsoleWindow()
+    if ($con -ne [IntPtr]::Zero) { [Win]::ShowWindow($con, $SW_MINIMIZE) | Out-Null }
+
     Refresh-WindowList
+    $form.Activate()
     $txt.Focus()
+
     $eng = Get-OcrEngine
     if ($eng) {
         Say "Ready. Pick the page to search, type a part number, press Enter." ([System.Drawing.Color]::ForestGreen)

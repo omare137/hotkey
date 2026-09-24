@@ -49,8 +49,8 @@ something to read.
 - Searches the recognised text for the part number
 - If not on screen, scrolls one page and re-scans, repeating until found
   or the bottom is reached
-- Draws a bright yellow translucent overlay on the matching row so the
-  operator knows exactly which line to click
+- Moves the mouse onto the matching row and clicks it, selecting that
+  row in IMR
 
 **Hard constraint:** stock Windows only. No Tesseract, no Python, no
 installs. Only `System.Drawing`, `System.Windows.Forms`, and
@@ -65,8 +65,8 @@ installs. Only `System.Drawing`, `System.Windows.Forms`, and
 | `01-probe.ps1` | MSAA approach: read-only probe, reports whether the grid is readable and prints config values |
 | `02-part-search.ps1` | MSAA approach: always-on-top search box, finds and selects the matching row |
 | `03-ocr-spike.ps1` | OCR approach: Phase 0 feasibility test — screenshots the grid, runs Windows OCR once, prints raw results |
-| `04-ocr-search.ps1` | OCR approach: full search tool with window picker, scrolling and highlight overlay |
-| `Test-Grid.ps1` | A fake 25-row grid for trying the tool without IMR. Launched from the **Test grid** button, no need to run it yourself |
+| `04-ocr-search.ps1` | OCR approach: full search tool with window picker, scrolling, and click-the-row |
+| `Test-Grid.ps1` | A fake 25-row grid for trying the tool without IMR |
 
 ### Double-click launchers
 
@@ -76,6 +76,7 @@ installs. Only `System.Drawing`, `System.Windows.Forms`, and
 | `Run-Probe.bat` | The MSAA probe (01) |
 | `Run-Search-MSAA.bat` | The MSAA search tool (02) |
 | `Run-OCR-Spike.bat` | The OCR feasibility spike (03) |
+| `Run-Test-Grid.bat` | The fake grid, for trying the tool without IMR |
 
 ---
 
@@ -158,24 +159,79 @@ open window. Pick the one holding the grid:
   `Incoming`, which is the normal IMR case.
 - Or pick IMR explicitly from the list if the title differs.
 - **Refresh** rescans the list after you open or close a window.
-- **Test grid** opens a fake 25-row grid so you can try the tool
-  without IMR, then selects it in the list for you.
+
+The PowerShell console minimises itself once the search box is up. It
+is minimised rather than hidden on purpose — if the script ever dies,
+the window is still in the taskbar so you can restore it and read the
+error.
+
+To try the tool without IMR, double-click `Run-Test-Grid.bat` for a
+fake 25-row grid, then pick it in the dropdown.
 
 Then type a part number and press Enter. The tool:
-- Brings the selected window to the front
-- Hides its own search box (so OCR can't read the term back and
-  false-match on it), screenshots the window, and runs OCR
+- Brings the selected window to the front and drops its own search box
+  behind it (so the box isn't in the screenshot, isn't under the
+  pointer, and can't swallow the click)
+- Screenshots the window and runs OCR
 - If the part isn't on screen, scrolls the grid and re-scans
-- Draws a yellow highlight overlay on the matching row
+- **Moves the mouse onto the matching row and clicks it**, so IMR
+  selects that row exactly as if you had clicked it by hand
 
-The overlay lasts 8 seconds (configurable via `$HighlightSec`) and can
-be clicked or dismissed with any key. The operator clicks the row in
-IMR underneath it.
+Press **Esc** to abort a long search.
+
+### How scrolling works
+
+The rows live in a *child* control inside the window. Posting
+`WM_MOUSEWHEEL` or `WM_VSCROLL` to the top-level window scrolls
+nothing, because those messages never reach the control that owns the
+scrollbar — and in an owner-drawn grid there's no reliable way to find
+that control.
+
+So the tool parks the real mouse pointer over the grid and emits a real
+wheel event. Windows routes it to whatever is under the pointer, exactly
+as if you'd spun the wheel yourself, which works no matter how the grid
+is built.
+
+There is also no dependable way to jump straight to the top. Instead the
+tool sweeps **down to the bottom, then back up to the top**. Those two
+passes together cover the whole grid from wherever you happened to be
+sitting, without needing an absolute position. It knows it has reached an
+end when a scroll stops changing what OCR reads.
+
+- `$WheelNotches` — how far each scroll step moves (default 5 notches,
+  roughly 15 rows). **Lower it if rows get skipped between scans**;
+  raise it to sweep long orders faster.
+- `$MaxPages` — safety limit on scroll steps, applied to each pass
+  separately.
 
 - **Fuzzy OCR** (`$FuzzyOCR = $true`) — treats common OCR confusable
   characters (0/O, 1/I/l, 5/S, 8/B) as equivalent when matching
-- **Shrink** — collapses to just the picker and the search box
 - **Ctrl+Shift+F** — recalls the window from anywhere
+
+### About the click
+
+A misplaced click in IMR could hit *Print Labels* or *Clear*, so the
+click is guarded three ways. It is skipped, with a message, unless:
+
+1. The target point lies inside the window that was captured.
+2. That window is genuinely the thing drawn at that point — nothing is
+   covering it.
+3. The pointer actually reached the requested position.
+
+The tool issues exactly one left click and nothing else. It never
+types and never presses a button.
+
+**While you are still confirming it aims correctly, set
+`$AutoClick = $false`** in the CONFIG block. The tool then only parks
+the mouse pointer on the row it found and leaves the clicking to you —
+all the benefit of the search, none of the risk of a stray click.
+
+> **Coordinates and display scaling.** The script calls
+> `SetProcessDPIAware()` at startup so the pixel it screenshots and the
+> pixel it clicks are the same point. Without that, Windows virtualises
+> coordinates on a scaled display (125%, 150%) and the aim drifts down
+> the grid. If you ever see it miss by a consistent number of rows,
+> display scaling is the first thing to suspect.
 
 ---
 
@@ -184,8 +240,16 @@ IMR underneath it.
 - **Unsupported.** Siemens did not sanction this. It is a workaround.
 - **Fragile to updates.** It depends on IMR's window layout. An update
   can break it with no warning.
-- **Operator aid only.** It reads the screen and highlights a row. It
-  deliberately does not click, save, or print.
+- **It clicks.** The OCR tool moves the mouse and left-clicks the row
+  it matched, which is a real input event — the same one a hand would
+  produce. It selects a row and nothing more: it never types, never
+  saves, and never presses Print. Set `$AutoClick = $false` to reduce
+  it to a pointer aid that clicks nothing.
+- **A wrong match means a wrong row selected.** OCR can misread a
+  character. The guards stop the click landing outside the grid, but
+  they cannot tell a correctly-aimed click on the wrong row from a
+  right one. The operator should still confirm the selected row before
+  acting on it.
 - **Per machine.** It runs on each PC where needed. Nothing installed,
   but the file must be available there.
 - **OCR approach is slower.** A few seconds per screen, plus scrolling
@@ -196,11 +260,108 @@ IMR underneath it.
 
 ---
 
+## Where the screenshots go
+
+Short answer: **nowhere.** The daily tool (`04-ocr-search.ps1`) never
+writes an image to disk, and nothing in this repo makes a network call
+of any kind.
+
+The capture path is entirely in memory:
+
+1. `CopyFromScreen` draws the window into a `System.Drawing.Bitmap` in RAM.
+2. It is encoded into a `MemoryStream`, then an
+   `InMemoryRandomAccessStream` — both RAM only, as the names say.
+3. `Windows.Media.Ocr` reads that and returns text plus bounding boxes.
+4. Every buffer is **overwritten with zeros and then released**, in a
+   `finally` block, on all paths including errors.
+
+Nothing is cached between searches, written to a log, or put on the
+clipboard.
+
+### Why zeroing, and not just disposing
+
+`Dispose()` hands memory back to the allocator; it does not erase it.
+The pixels stay readable in that freed block until something else
+happens to reuse it. So each copy of the screen is zeroed first:
+
+| Copy of the screen | How it is wiped |
+|---|---|
+| Raw `CopyFromScreen` bitmap | `LockBits` + zero fill, then dispose |
+| Upscaled/contrast-boosted bitmap | `LockBits` + zero fill, then dispose |
+| Encoded BMP byte array | `Array.Clear` |
+| `MemoryStream`'s internal array | `Array.Clear` on `GetBuffer()` |
+| Decoded `SoftwareBitmap` (what OCR reads) | `IMemoryBufferByteAccess` + zero fill — **best effort**, see below |
+
+The page text is **never retained**. Scroll detection only needs to
+know whether a page reads the same as the last one, so the tool keeps a
+SHA-256 fingerprint instead of the text — 32 bytes that cannot be read
+back into order data. After each search it forces a GC pass so the
+zeroed blocks are reclaimed immediately rather than eventually.
+
+The search box and the result line are blanked `$ClearAfterSec` seconds
+after a search (default 30), so a part number and the row it matched
+are not left on screen after the operator walks away.
+
+### What is *not* guaranteed
+
+Be straight about this if someone asks:
+
+- **The `SoftwareBitmap` wipe is best effort.** Reaching a WinRT buffer
+  needs COM interop that can fail on some Windows builds. It is wrapped
+  in a `try`/`catch`; if it fails, that one decoded copy goes back to
+  the allocator unwiped, and every other copy is still zeroed.
+- **Managed strings cannot be scrubbed.** The recognised text and the
+  term you type are .NET strings — immutable, moved by the GC, with no
+  supported way to overwrite them. They are dropped promptly, but
+  "dropped" is the honest word, not "erased".
+- **Paging is outside the script's control.** Windows may write any of
+  this memory to the pagefile, or to `hiberfil.sys` on sleep, before it
+  is wiped. Preventing that needs `VirtualLock` on every buffer, which
+  GDI+ and WinRT do not expose.
+- **The OS may capture the screen independently.** Clipboard history,
+  Windows Recall on Copilot+ PCs, DLP/endpoint agents and screen
+  recorders all see the same pixels regardless of what this tool does.
+- **Any process running as the same user can read this process's
+  memory.** That is a Windows property, not something a script can fix.
+
+None of that is an argument against the tool — it is the same footing
+as IMR itself, which has the data on screen either way. It is just the
+set of claims that will not survive a determined reviewer, so do not
+make them.
+
+**The OCR engine is on-device.** `Windows.Media.Ocr` is the local
+recognition engine built into Windows 10/11. It is not, and does not
+call, a cloud service.
+
+### The one exception
+
+`03-ocr-spike.ps1` — the diagnostic you run once to check OCR
+legibility — **does** save a PNG, by design, so you can see what OCR
+saw:
+
+```
+%TEMP%\imr-ocr-spike.png
+```
+
+That file **persists until something deletes it**, and on a real IMR
+window it is a picture containing live order data. The script now
+prints its location and the delete command when it finishes. To avoid
+writing it at all, set `$SaveShot = ''` at the top of that script.
+
+Nothing else in this repo writes an image anywhere.
+
+---
+
 ## What to tell quality / IT
 
 This tool reads the screen and (in OCR mode) moves the mouse wheel and
-draws an overlay. It does not read the database, does not read IMR's
-memory, and does not modify IMR or any data. It uses only software that
+the mouse pointer, and issues a single left click to select the row it
+found — the same input an operator's hand produces, and nothing beyond
+it. It does not read the database, does not read IMR's memory, and does
+not modify IMR or any data. It makes no network calls whatsoever, and
+the screenshots it takes are held in memory for a single OCR call and
+then released — none are written to disk (see **Where the screenshots
+go** above for the one diagnostic exception). It uses only software that
 ships with a standard Windows PC — the built-in OCR engine and built-in
 .NET, run from the PowerShell that is already on the machine. Nothing is
 installed or downloaded; the only thing placed on the workstation is the
