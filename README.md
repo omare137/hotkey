@@ -66,7 +66,7 @@ installs. Only `System.Drawing`, `System.Windows.Forms`, and
 | `02-part-search.ps1` | MSAA approach: always-on-top search box, finds and selects the matching row |
 | `03-ocr-spike.ps1` | OCR approach: Phase 0 feasibility test — screenshots the grid, runs Windows OCR once, prints raw results |
 | `04-ocr-search.ps1` | OCR approach: full search tool with window picker, scrolling, and click-the-row |
-| `Test-Grid.ps1` | A fake 25-row grid for trying the tool without IMR |
+| `Test-Grid.ps1` | A fake 25-row grid for trying the tool without IMR. Launched from the **Test grid** button, no need to run it yourself |
 
 ### Double-click launchers
 
@@ -76,7 +76,6 @@ installs. Only `System.Drawing`, `System.Windows.Forms`, and
 | `Run-Probe.bat` | The MSAA probe (01) |
 | `Run-Search-MSAA.bat` | The MSAA search tool (02) |
 | `Run-OCR-Spike.bat` | The OCR feasibility spike (03) |
-| `Run-Test-Grid.bat` | The fake grid, for trying the tool without IMR |
 
 ---
 
@@ -159,14 +158,8 @@ open window. Pick the one holding the grid:
   `Incoming`, which is the normal IMR case.
 - Or pick IMR explicitly from the list if the title differs.
 - **Refresh** rescans the list after you open or close a window.
-
-The PowerShell console minimises itself once the search box is up. It
-is minimised rather than hidden on purpose — if the script ever dies,
-the window is still in the taskbar so you can restore it and read the
-error.
-
-To try the tool without IMR, double-click `Run-Test-Grid.bat` for a
-fake 25-row grid, then pick it in the dropdown.
+- **Test grid** opens a fake 25-row grid so you can try the tool
+  without IMR, then selects it in the list for you.
 
 Then type a part number and press Enter. The tool:
 - Brings the selected window to the front and drops its own search box
@@ -206,6 +199,7 @@ end when a scroll stops changing what OCR reads.
 
 - **Fuzzy OCR** (`$FuzzyOCR = $true`) — treats common OCR confusable
   characters (0/O, 1/I/l, 5/S, 8/B) as equivalent when matching
+- **Shrink** — collapses to just the picker and the search box
 - **Ctrl+Shift+F** — recalls the window from anywhere
 
 ### About the click
