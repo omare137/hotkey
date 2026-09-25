@@ -743,25 +743,17 @@ function Report-Hit([IntPtr]$hwnd, $scan, [int]$pages, [System.Windows.Forms.Lab
 }
 
 # ---- UI --------------------------------------------------------------
-$script:selfTitle = "Find Part  -  Ctrl+Shift+F"
+$script:selfTitle = "Find Part  (OCR)   Ctrl+Shift+F to recall"
 
 $form                 = New-Object System.Windows.Forms.Form
-$form.SuspendLayout()
-
-# Every position and size below is written for a 100% display. The
-# process is DPI-aware (see SetProcessDPIAware above), so on a scaled
-# display (125%, 150%) the fonts render larger but fixed pixel boxes
-# would not, and text gets cut off. Declaring the layout as designed at
-# 96 DPI makes WinForms scale every control, and the window itself, by
-# the real display scale when the form loads, so boxes grow with text.
-$form.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
-$form.AutoScaleMode       = [System.Windows.Forms.AutoScaleMode]::Dpi
-
 $form.Text            = $script:selfTitle
-$form.ClientSize      = New-Object System.Drawing.Size(414, 193)
+$form.Size            = New-Object System.Drawing.Size(430, 232)
 $form.TopMost         = $true
-# Drag any edge or corner to resize.
+# Drag any edge or corner to resize. The minimum keeps the picker, the
+# search box and one line of the status (where results and errors
+# appear) visible however small it is made.
 $form.FormBorderStyle = 'Sizable'
+$form.MinimumSize     = New-Object System.Drawing.Size(330, 190)
 $form.MinimizeBox     = $true
 $form.MaximizeBox     = $false
 $form.ShowInTaskbar   = $true
@@ -773,13 +765,13 @@ $form.BackColor       = [System.Drawing.Color]::White
 $lblPage          = New-Object System.Windows.Forms.Label
 $lblPage.Text     = "Page to search:"
 $lblPage.Location = New-Object System.Drawing.Point(12, 14)
-$lblPage.Size     = New-Object System.Drawing.Size(100, 20)
+$lblPage.Size     = New-Object System.Drawing.Size(95, 20)
 $lblPage.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 $form.Controls.Add($lblPage)
 
 $cmbWindow           = New-Object System.Windows.Forms.ComboBox
-$cmbWindow.Location  = New-Object System.Drawing.Point(114, 11)
-$cmbWindow.Size      = New-Object System.Drawing.Size(224, 24)
+$cmbWindow.Location  = New-Object System.Drawing.Point(108, 11)
+$cmbWindow.Size      = New-Object System.Drawing.Size(230, 24)
 $cmbWindow.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
 $cmbWindow.DropDownStyle = 'DropDownList'
 $cmbWindow.DropDownWidth = 520
@@ -823,18 +815,6 @@ $lbl.Size     = New-Object System.Drawing.Size(400, 62)
 $lbl.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 $lbl.Anchor   = 'Top, Bottom, Left, Right'
 $form.Controls.Add($lbl)
-
-$form.ResumeLayout($false)
-
-# The minimum keeps the picker, the search box and one line of the
-# status (where results and errors appear) visible however small the
-# window is dragged. It is set after the auto-scale has run so it grows
-# with the display scale like everything else.
-$form.Add_Load({
-    $k = $form.CurrentAutoScaleDimensions.Width / 96.0
-    if ($k -lt 1) { $k = 1 }
-    $form.MinimumSize = New-Object System.Drawing.Size([int](330 * $k), [int](190 * $k))
-})
 
 function Say([string]$m, $c) { $lbl.ForeColor = $c; $lbl.Text = $m; $form.Refresh() }
 
