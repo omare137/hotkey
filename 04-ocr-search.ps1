@@ -749,7 +749,11 @@ $form                 = New-Object System.Windows.Forms.Form
 $form.Text            = $script:selfTitle
 $form.Size            = New-Object System.Drawing.Size(430, 232)
 $form.TopMost         = $true
-$form.FormBorderStyle = 'FixedSingle'
+# Drag any edge or corner to resize. The minimum keeps the picker, the
+# search box and one line of the status (where results and errors
+# appear) visible however small it is made.
+$form.FormBorderStyle = 'Sizable'
+$form.MinimumSize     = New-Object System.Drawing.Size(330, 190)
 $form.MinimizeBox     = $true
 $form.MaximizeBox     = $false
 $form.ShowInTaskbar   = $true
@@ -771,6 +775,7 @@ $cmbWindow.Size      = New-Object System.Drawing.Size(230, 24)
 $cmbWindow.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
 $cmbWindow.DropDownStyle = 'DropDownList'
 $cmbWindow.DropDownWidth = 520
+$cmbWindow.Anchor    = 'Top, Left, Right'
 $form.Controls.Add($cmbWindow)
 
 $btnRefresh          = New-Object System.Windows.Forms.Button
@@ -778,6 +783,7 @@ $btnRefresh.Text     = "Refresh"
 $btnRefresh.Location = New-Object System.Drawing.Point(344, 10)
 $btnRefresh.Size     = New-Object System.Drawing.Size(62, 25)
 $btnRefresh.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
+$btnRefresh.Anchor   = 'Top, Right'
 $form.Controls.Add($btnRefresh)
 
 # --- search box ---
@@ -785,12 +791,14 @@ $txt          = New-Object System.Windows.Forms.TextBox
 $txt.Location = New-Object System.Drawing.Point(12, 46)
 $txt.Size     = New-Object System.Drawing.Size(285, 32)
 $txt.Font     = New-Object System.Drawing.Font("Segoe UI", 14)
+$txt.Anchor   = 'Top, Left, Right'
 $form.Controls.Add($txt)
 
 $btnSearch          = New-Object System.Windows.Forms.Button
 $btnSearch.Text     = "Search"
 $btnSearch.Location = New-Object System.Drawing.Point(306, 45)
 $btnSearch.Size     = New-Object System.Drawing.Size(100, 33)
+$btnSearch.Anchor   = 'Top, Right'
 $form.Controls.Add($btnSearch)
 
 $hint          = New-Object System.Windows.Forms.Label
@@ -805,6 +813,7 @@ $lbl          = New-Object System.Windows.Forms.Label
 $lbl.Location = New-Object System.Drawing.Point(12, 120)
 $lbl.Size     = New-Object System.Drawing.Size(400, 62)
 $lbl.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+$lbl.Anchor   = 'Top, Bottom, Left, Right'
 $form.Controls.Add($lbl)
 
 function Say([string]$m, $c) { $lbl.ForeColor = $c; $lbl.Text = $m; $form.Refresh() }
