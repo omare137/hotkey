@@ -771,7 +771,7 @@ $form.Controls.Add($lblPage)
 
 $cmbWindow           = New-Object System.Windows.Forms.ComboBox
 $cmbWindow.Location  = New-Object System.Drawing.Point(108, 11)
-$cmbWindow.Size      = New-Object System.Drawing.Size(230, 24)
+$cmbWindow.Size      = New-Object System.Drawing.Size(214, 24)
 $cmbWindow.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
 $cmbWindow.DropDownStyle = 'DropDownList'
 $cmbWindow.DropDownWidth = 520
@@ -780,8 +780,8 @@ $form.Controls.Add($cmbWindow)
 
 $btnRefresh          = New-Object System.Windows.Forms.Button
 $btnRefresh.Text     = "Refresh"
-$btnRefresh.Location = New-Object System.Drawing.Point(344, 10)
-$btnRefresh.Size     = New-Object System.Drawing.Size(62, 25)
+$btnRefresh.Location = New-Object System.Drawing.Point(328, 10)
+$btnRefresh.Size     = New-Object System.Drawing.Size(78, 25)
 $btnRefresh.Font     = New-Object System.Drawing.Font("Segoe UI", 8)
 $btnRefresh.Anchor   = 'Top, Right'
 $form.Controls.Add($btnRefresh)
