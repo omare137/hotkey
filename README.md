@@ -341,6 +341,24 @@ writing it at all, set `$SaveShot = ''` at the top of that script.
 
 Nothing else in this repo writes an image anywhere.
 
+### The startup cache
+
+To start faster, the search tool compiles its small block of C# helper
+code once and saves it as a DLL under
+`%LOCALAPPDATA%\IMRPartSearch\helpers-<hash>.dll`. Later launches load
+that instead of recompiling, which saves a few seconds each time.
+
+- It contains **only the tool's own code** — no screenshots, no text,
+  no order data.
+- The `<hash>` is a fingerprint of the source, so an updated script
+  never loads an old helper; it compiles a fresh one alongside.
+- Delete the folder at any time; the next launch rebuilds it. If the
+  folder can't be written, the tool silently falls back to compiling
+  in memory as before.
+- It sits in a folder only your user can write to, so it adds no
+  exposure beyond the script file itself, which that same user can
+  already edit.
+
 ---
 
 ## What to tell quality / IT
@@ -355,8 +373,9 @@ then released — none are written to disk (see **Where the screenshots
 go** above for the one diagnostic exception). It uses only software that
 ships with a standard Windows PC — the built-in OCR engine and built-in
 .NET, run from the PowerShell that is already on the machine. Nothing is
-installed or downloaded; the only thing placed on the workstation is the
-script file itself.
+installed or downloaded. Besides the script files, the only thing it
+writes is a small cache of its own compiled helper code, which contains
+no screen content or data (see **The startup cache** above).
 
 ---
 
