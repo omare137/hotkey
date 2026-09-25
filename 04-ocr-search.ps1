@@ -18,7 +18,9 @@
 #  STOCK WINDOWS ONLY. Nothing installed, nothing downloaded.
 #  Uses only System.Drawing, System.Windows.Forms, and the
 #  Windows.Media.Ocr engine that ships with Windows 10/11.
-#  The only thing placed on the machine is this script file.
+#  Besides this script, the only thing written to the machine is a
+#  small cache of its own compiled helper code (no screen content),
+#  under %LOCALAPPDATA%\IMRPartSearch, to make startup faster.
 #
 #  WHAT THIS DOES NOT DO:
 #    - does not install anything
@@ -71,7 +73,7 @@ $ClearAfterSec = 30
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
 
-Add-Type -Language CSharp @"
+$helperSource = @"
 using System;
 using System.Text;
 using System.Collections.Generic;
@@ -150,6 +152,50 @@ public interface IMemoryBufferByteAccess {
     void GetBuffer(out IntPtr buffer, out uint capacity);
 }
 "@
+
+# ---- load the helpers, compiling only when needed --------------------
+# Compiling the C# above spins up the compiler and costs a few seconds
+# on every launch. Compile once to a small DLL under the user's local
+# app data and load that afterwards. The file name carries a hash of the
+# source, so an edited script never loads a stale helper -- it just
+# compiles a fresh one. The DLL holds only this tool's own code, never
+# any screen content or order data.
+#
+# Anything going wrong with the cache (no write access, a damaged file)
+# falls back to compiling in memory, which is exactly the old behaviour.
+function Import-Helpers([string]$source) {
+    $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:TEMP }
+    $dir  = Join-Path $base 'IMRPartSearch'
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($source))[0..7] |
+                       ForEach-Object { $_.ToString('x2') })
+    }
+    finally { $sha.Dispose() }
+    $dll = Join-Path $dir "helpers-$hash.dll"
+
+    if (Test-Path $dll) {
+        try { Add-Type -Path $dll; return }
+        catch { Remove-Item $dll -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Compiling to a file may or may not also load the types, depending
+    # on the PowerShell build, so check before each further step rather
+    # than risk defining the same types twice.
+    try {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $dll -OutputType Library
+        if (-not ('Win' -as [type])) { Add-Type -Path $dll }
+    }
+    catch { }
+
+    if (-not ('Win' -as [type])) {
+        Add-Type -TypeDefinition $source -Language CSharp
+    }
+}
+
+Import-Helpers $helperSource
 
 # Opt into real screen pixels before any window exists. Without this,
 # Windows virtualises coordinates for this process on a scaled display
